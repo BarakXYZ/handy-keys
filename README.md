@@ -8,6 +8,7 @@ Cross-platform global keyboard shortcuts library for Rust.
 - **Global hotkeys**: Register system-wide keyboard shortcuts
 - **Hotkey blocking**: Registered hotkeys are blocked from reaching other applications
 - **Modifier-only hotkeys**: Support for shortcuts like `Cmd+Shift` without a key
+- **Double-tap patterns**: Detect repeated taps of one key or side-specific modifier, e.g. `shift_left`
 - **String parsing**: Parse hotkeys from strings like `"Ctrl+Alt+Space"`
 - **Hotkey recording**: Low-level keyboard listener for "record a hotkey" UI flows
 - **Serde support**: All types implement `Serialize`/`Deserialize`
@@ -170,6 +171,24 @@ while let Ok(event) = listener.recv() {
     }
 }
 ```
+
+## Double-tap Patterns
+
+Tap patterns are for actions such as push-to-talk toggles:
+
+```rust
+use handy_keys::{Hotkey, TapPattern, TapPatternRecognizer, TriggerKey};
+use std::time::Duration;
+
+let trigger = TriggerKey::from_hotkey("shift_left".parse::<Hotkey>()?)?;
+let pattern = TapPattern::double_tap(trigger, Duration::from_millis(250))?;
+
+let mut recognizer = TapPatternRecognizer::new();
+let id = recognizer.register(pattern)?;
+# Ok::<(), handy_keys::Error>(())
+```
+
+The current MVP accepts exactly double-tap patterns. Triggers must be one regular key or one concrete modifier side such as `shift_left`; compound modifiers and chords are rejected.
 
 ## License
 

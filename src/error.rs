@@ -1,4 +1,4 @@
-use crate::types::HotkeyId;
+use crate::types::{HotkeyId, TapPatternId};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -21,6 +21,12 @@ pub enum Error {
     #[error("Hotkey already registered: {0}")]
     HotkeyAlreadyRegistered(String),
 
+    #[error("Tap pattern with id {0:?} not found")]
+    TapPatternNotFound(TapPatternId),
+
+    #[error("Tap pattern already registered: {0}")]
+    TapPatternAlreadyRegistered(String),
+
     #[error("Event loop not running")]
     EventLoopNotRunning,
 
@@ -38,6 +44,9 @@ pub enum Error {
 
     #[error("Invalid hotkey format: {0}")]
     InvalidHotkeyFormat(String),
+
+    #[error("Invalid tap pattern: {0}")]
+    InvalidTapPattern(String),
 
     #[error("Unknown key: {0}")]
     UnknownKey(String),

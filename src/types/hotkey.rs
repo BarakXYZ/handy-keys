@@ -258,7 +258,7 @@ pub enum HotkeyState {
 }
 
 /// Event emitted when a hotkey is pressed or released
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HotkeyEvent {
     pub id: HotkeyId,
     pub state: HotkeyState,

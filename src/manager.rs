@@ -4,10 +4,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use crate::error::{Error, Result};
 use crate::listener::{BlockingHotkeys, KeyboardListener};
-use crate::types::{Hotkey, HotkeyEvent, HotkeyId, HotkeyState, KeyEvent};
+use crate::tap_pattern::TapPatternRecognizer;
+use crate::types::{
+    HandyKeysEvent, Hotkey, HotkeyEvent, HotkeyId, HotkeyState, KeyEvent, TapPattern,
+    TapPatternEvent, TapPatternId,
+};
 
 /// Internal state shared between the manager and the processing thread
 struct ManagerState {
@@ -15,6 +20,7 @@ struct ManagerState {
     next_id: u32,
     /// Track which hotkeys are currently pressed
     pressed_hotkeys: HashSet<HotkeyId>,
+    tap_patterns: TapPatternRecognizer,
 }
 
 impl ManagerState {
@@ -23,6 +29,7 @@ impl ManagerState {
             hotkeys: HashMap::new(),
             next_id: 0,
             pressed_hotkeys: HashSet::new(),
+            tap_patterns: TapPatternRecognizer::new(),
         }
     }
 
@@ -79,6 +86,16 @@ impl ManagerState {
 
         results
     }
+
+    fn process_all_events(
+        &mut self,
+        event: &KeyEvent,
+        now: Instant,
+    ) -> (Vec<HotkeyEvent>, Vec<TapPatternEvent>) {
+        let hotkey_events = self.process_event(event);
+        let tap_events = self.tap_patterns.process_event_at(event, now);
+        (hotkey_events, tap_events)
+    }
 }
 
 /// Platform-agnostic Hotkey Manager
@@ -92,6 +109,7 @@ impl ManagerState {
 pub struct HotkeyManager {
     state: Arc<Mutex<ManagerState>>,
     event_receiver: Receiver<HotkeyEvent>,
+    tap_event_receiver: Receiver<TapPatternEvent>,
     _thread_handle: Option<JoinHandle<()>>,
     running: Arc<std::sync::atomic::AtomicBool>,
     /// Shared set of hotkeys to block
@@ -106,6 +124,7 @@ impl HotkeyManager {
         let listener = KeyboardListener::new()?;
 
         let (tx, rx) = mpsc::channel();
+        let (tap_tx, tap_rx) = mpsc::channel();
         let state = Arc::new(Mutex::new(ManagerState::new()));
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
@@ -113,12 +132,13 @@ impl HotkeyManager {
         let thread_running = Arc::clone(&running);
 
         let handle = thread::spawn(move || {
-            Self::event_loop(listener, thread_state, tx, thread_running);
+            Self::event_loop(listener, thread_state, tx, tap_tx, thread_running);
         });
 
         Ok(Self {
             state,
             event_receiver: rx,
+            tap_event_receiver: tap_rx,
             _thread_handle: Some(handle),
             running,
             blocking_hotkeys: None,
@@ -137,6 +157,7 @@ impl HotkeyManager {
         let listener = KeyboardListener::new_with_blocking(blocking_hotkeys.clone())?;
 
         let (tx, rx) = mpsc::channel();
+        let (tap_tx, tap_rx) = mpsc::channel();
         let state = Arc::new(Mutex::new(ManagerState::new()));
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
@@ -144,12 +165,13 @@ impl HotkeyManager {
         let thread_running = Arc::clone(&running);
 
         let handle = thread::spawn(move || {
-            Self::event_loop(listener, thread_state, tx, thread_running);
+            Self::event_loop(listener, thread_state, tx, tap_tx, thread_running);
         });
 
         Ok(Self {
             state,
             event_receiver: rx,
+            tap_event_receiver: tap_rx,
             _thread_handle: Some(handle),
             running,
             blocking_hotkeys: Some(blocking_hotkeys),
@@ -161,6 +183,7 @@ impl HotkeyManager {
         listener: KeyboardListener,
         state: Arc<Mutex<ManagerState>>,
         sender: Sender<HotkeyEvent>,
+        tap_sender: Sender<TapPatternEvent>,
         running: Arc<std::sync::atomic::AtomicBool>,
     ) {
         const RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
@@ -170,9 +193,16 @@ impl HotkeyManager {
             match listener.recv_timeout(RECV_TIMEOUT) {
                 Ok(key_event) => {
                     if let Ok(mut state) = state.lock() {
-                        let hotkey_events = state.process_event(&key_event);
+                        let (hotkey_events, tap_events) =
+                            state.process_all_events(&key_event, Instant::now());
                         for event in hotkey_events {
                             if sender.send(event).is_err() {
+                                // Receiver dropped, exit
+                                return;
+                            }
+                        }
+                        for event in tap_events {
+                            if tap_sender.send(event).is_err() {
                                 // Receiver dropped, exit
                                 return;
                             }
@@ -251,6 +281,24 @@ impl HotkeyManager {
         state.hotkeys.get(&id).copied()
     }
 
+    /// Register a tap pattern and return its unique ID.
+    pub fn register_tap_pattern(&self, pattern: TapPattern) -> Result<TapPatternId> {
+        let mut state = self.state.lock().map_err(|_| Error::MutexPoisoned)?;
+        state.tap_patterns.register(pattern)
+    }
+
+    /// Unregister a tap pattern by its ID.
+    pub fn unregister_tap_pattern(&self, id: TapPatternId) -> Result<()> {
+        let mut state = self.state.lock().map_err(|_| Error::MutexPoisoned)?;
+        state.tap_patterns.unregister(id)
+    }
+
+    /// Get the tap pattern definition associated with an ID.
+    pub fn get_tap_pattern(&self, id: TapPatternId) -> Option<TapPattern> {
+        let state = self.state.lock().ok()?;
+        state.tap_patterns.get(id)
+    }
+
     /// Blocking receive for hotkey events
     ///
     /// Blocks until a hotkey event is received or the event loop stops.
@@ -271,6 +319,32 @@ impl HotkeyManager {
         }
     }
 
+    /// Blocking receive for tap-pattern events.
+    pub fn recv_tap_pattern(&self) -> Result<TapPatternEvent> {
+        self.tap_event_receiver
+            .recv()
+            .map_err(|_| Error::EventLoopNotRunning)
+    }
+
+    /// Non-blocking receive for tap-pattern events.
+    pub fn try_recv_tap_pattern(&self) -> Option<TapPatternEvent> {
+        match self.tap_event_receiver.try_recv() {
+            Ok(event) => Some(event),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => None,
+        }
+    }
+
+    /// Non-blocking receive for any HandyKeys event.
+    ///
+    /// Existing typed receivers remain the source of truth. This convenience
+    /// method checks hotkey events before tap-pattern events.
+    pub fn try_recv_event(&self) -> Option<HandyKeysEvent> {
+        self.try_recv()
+            .map(HandyKeysEvent::Hotkey)
+            .or_else(|| self.try_recv_tap_pattern().map(HandyKeysEvent::TapPattern))
+    }
+
     /// Get the number of currently registered hotkeys
     pub fn hotkey_count(&self) -> usize {
         let state = if let Ok(s) = self.state.lock() {
@@ -279,6 +353,16 @@ impl HotkeyManager {
             return 0;
         };
         state.hotkeys.len()
+    }
+
+    /// Get the number of currently registered tap patterns
+    pub fn tap_pattern_count(&self) -> usize {
+        let state = if let Ok(s) = self.state.lock() {
+            s
+        } else {
+            return 0;
+        };
+        state.tap_patterns.count()
     }
 }
 
@@ -296,7 +380,8 @@ impl Drop for HotkeyManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Key, Modifiers};
+    use crate::types::{Key, Modifiers, TapPattern, TriggerKey};
+    use std::time::{Duration, Instant};
 
     fn make_key_event(modifiers: Modifiers, key: Option<Key>, is_key_down: bool) -> KeyEvent {
         KeyEvent {
@@ -627,6 +712,44 @@ mod tests {
             let event = make_key_event(Modifiers::CMD_RIGHT, Some(Key::K), true);
             let results = state.process_event(&event);
             assert_eq!(results.len(), 1);
+        }
+
+        #[test]
+        fn tap_pattern_registration_lookup_and_unregister() {
+            let mut state = ManagerState::new();
+            let pattern = TapPattern::double_tap(
+                TriggerKey::Modifier(Modifiers::SHIFT_LEFT),
+                Duration::from_millis(250),
+            )
+            .unwrap();
+
+            let id = state.tap_patterns.register(pattern).unwrap();
+            assert_eq!(state.tap_patterns.get(id), Some(pattern));
+            assert_eq!(state.tap_patterns.count(), 1);
+
+            state.tap_patterns.unregister(id).unwrap();
+            assert_eq!(state.tap_patterns.count(), 0);
+        }
+
+        #[test]
+        fn process_all_events_includes_tap_pattern_events() {
+            let mut state = ManagerState::new();
+            let pattern =
+                TapPattern::double_tap(TriggerKey::Key(Key::D), Duration::from_millis(250))
+                    .unwrap();
+            let id = state.tap_patterns.register(pattern).unwrap();
+            let start = Instant::now();
+
+            let first_down = make_key_event(Modifiers::empty(), Some(Key::D), true);
+            let first_up = make_key_event(Modifiers::empty(), Some(Key::D), false);
+            let second_down = make_key_event(Modifiers::empty(), Some(Key::D), true);
+
+            assert!(state.process_all_events(&first_down, start).1.is_empty());
+            state.process_all_events(&first_up, start + Duration::from_millis(10));
+            let (_, tap_events) =
+                state.process_all_events(&second_down, start + Duration::from_millis(50));
+
+            assert_eq!(tap_events, vec![TapPatternEvent { id, tap_count: 2 }]);
         }
     }
 }
