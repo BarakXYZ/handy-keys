@@ -749,7 +749,14 @@ mod tests {
             let (_, tap_events) =
                 state.process_all_events(&second_down, start + Duration::from_millis(50));
 
-            assert_eq!(tap_events, vec![TapPatternEvent { id, tap_count: 2 }]);
+            assert_eq!(
+                tap_events,
+                vec![TapPatternEvent {
+                    id,
+                    tap_count: 2,
+                    is_key_down: true,
+                }]
+            );
         }
     }
 }

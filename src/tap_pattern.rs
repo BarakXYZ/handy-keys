@@ -13,11 +13,18 @@ struct ActiveTapSequence {
     last_tap_at: Instant,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ActiveTapHold {
+    id: TapPatternId,
+    tap_count: u8,
+}
+
 /// Recognizes repeated taps from raw HandyKeys key events.
 #[derive(Debug)]
 pub struct TapPatternRecognizer {
     patterns: HashMap<TapPatternId, TapPattern>,
     active: Option<ActiveTapSequence>,
+    active_holds: HashMap<TriggerKey, ActiveTapHold>,
     held_triggers: HashSet<TriggerKey>,
     next_id: u32,
 }
@@ -27,6 +34,7 @@ impl Default for TapPatternRecognizer {
         Self {
             patterns: HashMap::new(),
             active: None,
+            active_holds: HashMap::new(),
             held_triggers: HashSet::new(),
             next_id: 1,
         }
@@ -88,6 +96,13 @@ impl TapPatternRecognizer {
 
         if !event.is_key_down {
             self.held_triggers.remove(&trigger);
+            if let Some(active_hold) = self.active_holds.remove(&trigger) {
+                return vec![TapPatternEvent {
+                    id: active_hold.id,
+                    tap_count: active_hold.tap_count,
+                    is_key_down: false,
+                }];
+            }
             return Vec::new();
         }
 
@@ -122,9 +137,19 @@ impl TapPatternRecognizer {
 
         if count >= pattern.tap_count {
             self.active = None;
+            if pattern.mode == crate::types::TapPatternMode::TapThenHold {
+                self.active_holds.insert(
+                    trigger,
+                    ActiveTapHold {
+                        id,
+                        tap_count: count,
+                    },
+                );
+            }
             return vec![TapPatternEvent {
                 id,
                 tap_count: count,
+                is_key_down: true,
             }];
         }
 
@@ -201,7 +226,14 @@ mod tests {
 
         let events = recognizer
             .process_event_at(&key_event(Key::D, true), start + Duration::from_millis(120));
-        assert_eq!(events, vec![TapPatternEvent { id, tap_count: 2 }]);
+        assert_eq!(
+            events,
+            vec![TapPatternEvent {
+                id,
+                tap_count: 2,
+                is_key_down: true,
+            }]
+        );
 
         recognizer.process_event_at(&key_event(Key::D, false), start);
         assert!(recognizer
@@ -296,7 +328,8 @@ mod tests {
             f_events,
             vec![TapPatternEvent {
                 id: f_id,
-                tap_count: 2
+                tap_count: 2,
+                is_key_down: true,
             }]
         );
 
@@ -309,7 +342,8 @@ mod tests {
             d_events,
             vec![TapPatternEvent {
                 id: d_id,
-                tap_count: 2
+                tap_count: 2,
+                is_key_down: true,
             }]
         );
     }
@@ -323,5 +357,65 @@ mod tests {
             recognizer.register(pattern),
             Err(Error::TapPatternAlreadyRegistered(_))
         ));
+    }
+
+    #[test]
+    fn double_tap_hold_emits_pressed_on_second_press_and_released_on_second_release() {
+        let start = Instant::now();
+        let mut recognizer = TapPatternRecognizer::new();
+        let id = recognizer
+            .register(
+                TapPattern::double_tap_hold(
+                    TriggerKey::Modifier(Modifiers::OPT_RIGHT),
+                    Duration::from_millis(250),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        assert!(recognizer
+            .process_event_at(&modifier_event(Modifiers::OPT_RIGHT, true), start)
+            .is_empty());
+        assert!(recognizer
+            .process_event_at(
+                &modifier_event(Modifiers::OPT_RIGHT, false),
+                start + Duration::from_millis(20),
+            )
+            .is_empty());
+
+        assert_eq!(
+            recognizer.process_event_at(
+                &modifier_event(Modifiers::OPT_RIGHT, true),
+                start + Duration::from_millis(120),
+            ),
+            vec![TapPatternEvent {
+                id,
+                tap_count: 2,
+                is_key_down: true,
+            }]
+        );
+        assert!(recognizer
+            .process_event_at(
+                &modifier_event(Modifiers::OPT_RIGHT, true),
+                start + Duration::from_millis(140),
+            )
+            .is_empty());
+        assert_eq!(
+            recognizer.process_event_at(
+                &modifier_event(Modifiers::OPT_RIGHT, false),
+                start + Duration::from_millis(220),
+            ),
+            vec![TapPatternEvent {
+                id,
+                tap_count: 2,
+                is_key_down: false,
+            }]
+        );
+        assert!(recognizer
+            .process_event_at(
+                &modifier_event(Modifiers::OPT_RIGHT, false),
+                start + Duration::from_millis(240),
+            )
+            .is_empty());
     }
 }

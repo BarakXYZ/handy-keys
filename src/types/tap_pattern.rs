@@ -53,6 +53,7 @@ impl TriggerKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TapPatternMode {
     Lazy,
+    TapThenHold,
 }
 
 /// A repeated-tap trigger. MVP validation accepts double-tap only.
@@ -69,7 +70,20 @@ impl TapPattern {
         Self::new(trigger, 2, timeout)
     }
 
+    pub fn double_tap_hold(trigger: TriggerKey, timeout: Duration) -> Result<Self> {
+        Self::new_with_mode(trigger, 2, timeout, TapPatternMode::TapThenHold)
+    }
+
     pub fn new(trigger: TriggerKey, tap_count: u8, timeout: Duration) -> Result<Self> {
+        Self::new_with_mode(trigger, tap_count, timeout, TapPatternMode::Lazy)
+    }
+
+    pub fn new_with_mode(
+        trigger: TriggerKey,
+        tap_count: u8,
+        timeout: Duration,
+        mode: TapPatternMode,
+    ) -> Result<Self> {
         if tap_count != 2 {
             return Err(Error::InvalidTapPattern(
                 "only double-tap patterns are supported in this release".to_string(),
@@ -85,7 +99,7 @@ impl TapPattern {
             trigger,
             tap_count,
             timeout,
-            mode: TapPatternMode::Lazy,
+            mode,
         })
     }
 }
@@ -95,6 +109,7 @@ impl TapPattern {
 pub struct TapPatternEvent {
     pub id: TapPatternId,
     pub tap_count: u8,
+    pub is_key_down: bool,
 }
 
 /// Unified event type for callers that want both hotkey and tap-pattern events.
@@ -155,5 +170,6 @@ mod tests {
         assert!(TapPattern::new(trigger, 3, Duration::from_millis(250)).is_err());
         assert!(TapPattern::new(trigger, 2, Duration::ZERO).is_err());
         assert!(TapPattern::double_tap(trigger, Duration::from_millis(250)).is_ok());
+        assert!(TapPattern::double_tap_hold(trigger, Duration::from_millis(250)).is_ok());
     }
 }
