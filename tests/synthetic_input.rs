@@ -441,9 +441,6 @@ mod windows_tests {
     #[ignore = "needs an interactive desktop session; run: cargo test --test synthetic_input -- --ignored"]
     fn injected_f20_reaches_listener() {
         let listener = KeyboardListener::new().expect("failed to spawn keyboard listener");
-        // Give the hook thread a moment to install the hooks; spawn() does
-        // not currently wait for installation (known gap, see review notes).
-        std::thread::sleep(Duration::from_millis(200));
 
         send_f20(false);
         assert!(
@@ -496,7 +493,6 @@ mod windows_tests {
         const SC_QUOTE: u16 = 0x28; // right of ; (US '", UK '@)
 
         let listener = KeyboardListener::new().expect("failed to spawn keyboard listener");
-        std::thread::sleep(Duration::from_millis(200));
 
         send_scancode_key_up(SC_GRAVE);
         assert!(
@@ -539,7 +535,6 @@ mod windows_tests {
     #[ignore = "needs an interactive desktop session; run: cargo test --test synthetic_input -- --ignored"]
     fn injected_mouse_button_reaches_listener() {
         let listener = KeyboardListener::new().expect("failed to spawn keyboard listener");
-        std::thread::sleep(Duration::from_millis(200));
 
         send_mouse_flag(MOUSEEVENTF_MIDDLEUP, 0);
         assert!(
@@ -575,7 +570,6 @@ mod windows_tests {
     #[ignore = "needs an interactive desktop session; run: cargo test --test synthetic_input -- --ignored"]
     fn injected_media_keys_reach_listener() {
         let listener = KeyboardListener::new().expect("failed to spawn keyboard listener");
-        std::thread::sleep(Duration::from_millis(200));
 
         for (vk, key) in [
             (VK_MEDIA_PLAY_PAUSE, Key::PlayPause),

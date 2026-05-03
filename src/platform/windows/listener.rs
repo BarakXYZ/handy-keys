@@ -24,7 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
 };
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::platform::state::{release_events, stale_modifiers, BlockingHotkeys, RECONCILABLE};
 use crate::types::{Key, KeyEvent, Modifiers};
 
@@ -354,6 +354,50 @@ unsafe fn destroy_watcher_window(hwnd: HWND) {
     let _ = DestroyWindow(hwnd);
 }
 
+struct InstalledHooks {
+    keyboard: HHOOK,
+    mouse: HHOOK,
+}
+
+trait HookOps: Send {
+    fn install_keyboard(&mut self) -> Result<HHOOK>;
+    fn install_mouse(&mut self) -> Result<HHOOK>;
+    fn unhook(&mut self, hook: HHOOK);
+}
+
+struct RealHookOps;
+
+impl HookOps for RealHookOps {
+    fn install_keyboard(&mut self) -> Result<HHOOK> {
+        unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0) }
+            .map_err(|error| Error::Platform(format!("failed to install keyboard hook: {error:?}")))
+    }
+
+    fn install_mouse(&mut self) -> Result<HHOOK> {
+        unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0) }
+            .map_err(|error| Error::Platform(format!("failed to install mouse hook: {error:?}")))
+    }
+
+    fn unhook(&mut self, hook: HHOOK) {
+        unsafe {
+            let _ = UnhookWindowsHookEx(hook);
+        }
+    }
+}
+
+fn install_hooks(ops: &mut dyn HookOps) -> Result<InstalledHooks> {
+    let keyboard = ops.install_keyboard()?;
+    let mouse = match ops.install_mouse() {
+        Ok(hook) => hook,
+        Err(error) => {
+            ops.unhook(keyboard);
+            return Err(error);
+        }
+    };
+
+    Ok(InstalledHooks { keyboard, mouse })
+}
+
 /// Re-install the low-level hooks, defensively: Windows silently removes an LL
 /// hook whose callback exceeds its timeout budget, and a session away from the
 /// interactive desktop or a suspend/resume cycle is a common moment for that
@@ -363,23 +407,12 @@ unsafe fn destroy_watcher_window(hwnd: HWND) {
 /// The replacements are installed before the old hooks are removed, so a
 /// failure never leaves us hook-less. No messages are pumped between install
 /// and unhook, so no event is delivered twice.
-unsafe fn reinstall_hooks(kb_hook: &mut HHOOK, mouse_hook: &mut HHOOK) -> bool {
-    let new_kb = match SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0) {
-        Ok(h) => h,
-        Err(_) => return false,
-    };
-    let new_mouse = match SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0) {
-        Ok(h) => h,
-        Err(_) => {
-            let _ = UnhookWindowsHookEx(new_kb);
-            return false;
-        }
-    };
-    let _ = UnhookWindowsHookEx(*kb_hook);
-    let _ = UnhookWindowsHookEx(*mouse_hook);
-    *kb_hook = new_kb;
-    *mouse_hook = new_mouse;
-    true
+fn reinstall_hooks(hooks: &mut InstalledHooks, ops: &mut dyn HookOps) -> Result<()> {
+    let replacements = install_hooks(ops)?;
+    ops.unhook(hooks.keyboard);
+    ops.unhook(hooks.mouse);
+    *hooks = replacements;
+    Ok(())
 }
 
 /// Internal listener state returned to KeyboardListener
@@ -392,7 +425,15 @@ pub(crate) struct WindowsListenerState {
 
 /// Spawn a Windows low-level keyboard hook listener
 pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<WindowsListenerState> {
+    spawn_with_hook_ops(blocking_hotkeys, Box::new(RealHookOps))
+}
+
+fn spawn_with_hook_ops(
+    blocking_hotkeys: Option<BlockingHotkeys>,
+    mut hook_ops: Box<dyn HookOps>,
+) -> Result<WindowsListenerState> {
     let (tx, rx) = mpsc::channel();
+    let (init_tx, init_rx) = mpsc::channel::<Result<()>>();
     let running = Arc::new(AtomicBool::new(true));
     let thread_running = Arc::clone(&running);
     let thread_blocking = blocking_hotkeys.clone();
@@ -409,29 +450,16 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<Windows
             });
         });
 
-        // Install the low-level keyboard hook
-        let kb_hook =
-            unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook_proc), None, 0) };
-
-        let mut kb_hook = match kb_hook {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("Failed to install keyboard hook: {:?}", e);
-                return;
+        let mut hooks = match install_hooks(hook_ops.as_mut()) {
+            Ok(hooks) => {
+                let _ = init_tx.send(Ok(()));
+                hooks
             }
-        };
-
-        // Install the low-level mouse hook
-        let mouse_hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), None, 0) };
-
-        let mut mouse_hook = match mouse_hook {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("Failed to install mouse hook: {:?}", e);
-                // Clean up keyboard hook before returning
-                unsafe {
-                    let _ = UnhookWindowsHookEx(kb_hook);
-                }
+            Err(error) => {
+                HOOK_CONTEXT.with(|ctx| {
+                    *ctx.borrow_mut() = None;
+                });
+                let _ = init_tx.send(Err(error));
                 return;
             }
         };
@@ -465,16 +493,17 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<Windows
             // drain loop) -- WM_POWERBROADCAST always, WM_WTSSESSION_CHANGE
             // on builds that send rather than post it.
             if outcome.reinstall_hooks || take_reinstall_request() {
-                unsafe {
-                    if reinstall_hooks(&mut kb_hook, &mut mouse_hook) {
+                match reinstall_hooks(&mut hooks, hook_ops.as_mut()) {
+                    Ok(()) => {
                         // At most a few lines per unlock/resume, and it makes
                         // the re-arm observable in the field.
                         eprintln!("handy-keys: re-armed hooks after session/power change");
-                    } else {
+                    }
+                    Err(error) => {
                         // Keep the old hooks: they usually still work (the
                         // reinstall is defensive hardening, not a repair).
                         eprintln!(
-                            "handy-keys: failed to re-install hooks after session/power change"
+                            "handy-keys: failed to re-install hooks after session/power change: {error}"
                         );
                     }
                 }
@@ -491,16 +520,28 @@ pub(crate) fn spawn(blocking_hotkeys: Option<BlockingHotkeys>) -> Result<Windows
                 destroy_watcher_window(hwnd);
             }
         }
-        unsafe {
-            let _ = UnhookWindowsHookEx(kb_hook);
-            let _ = UnhookWindowsHookEx(mouse_hook);
-        }
+        hook_ops.unhook(hooks.keyboard);
+        hook_ops.unhook(hooks.mouse);
 
         // Clear thread-local state
         HOOK_CONTEXT.with(|ctx| {
             *ctx.borrow_mut() = None;
         });
     });
+
+    match init_rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let _ = handle.join();
+            return Err(error);
+        }
+        Err(_) => {
+            let _ = handle.join();
+            return Err(Error::Platform(
+                "Windows hook thread terminated during startup".to_string(),
+            ));
+        }
+    }
 
     Ok(WindowsListenerState {
         event_receiver: rx,
@@ -804,8 +845,82 @@ fn should_block_hotkey(
 }
 
 #[cfg(test)]
-mod tests {
+mod test_hooks {
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
     use super::*;
+
+    enum Mode {
+        Success,
+        KeyboardFailure,
+        MouseFailure,
+    }
+
+    pub struct FakeHookOps {
+        mode: Mode,
+        unhook_count: Arc<AtomicUsize>,
+    }
+
+    impl FakeHookOps {
+        pub fn success(unhook_count: Arc<AtomicUsize>) -> Self {
+            Self {
+                mode: Mode::Success,
+                unhook_count,
+            }
+        }
+
+        pub fn keyboard_failure() -> Self {
+            Self {
+                mode: Mode::KeyboardFailure,
+                unhook_count: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        pub fn mouse_failure(unhook_count: Arc<AtomicUsize>) -> Self {
+            Self {
+                mode: Mode::MouseFailure,
+                unhook_count,
+            }
+        }
+    }
+
+    fn fake_hook() -> HHOOK {
+        HHOOK(std::ptr::dangling_mut::<c_void>())
+    }
+
+    impl HookOps for FakeHookOps {
+        fn install_keyboard(&mut self) -> Result<HHOOK> {
+            match self.mode {
+                Mode::KeyboardFailure => Err(Error::Platform(
+                    "failed to install keyboard hook".to_string(),
+                )),
+                Mode::Success | Mode::MouseFailure => Ok(fake_hook()),
+            }
+        }
+
+        fn install_mouse(&mut self) -> Result<HHOOK> {
+            match self.mode {
+                Mode::Success | Mode::KeyboardFailure => Ok(fake_hook()),
+                Mode::MouseFailure => {
+                    Err(Error::Platform("failed to install mouse hook".to_string()))
+                }
+            }
+        }
+
+        fn unhook(&mut self, _hook: HHOOK) {
+            self.unhook_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_hooks;
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
     use windows::Win32::UI::WindowsAndMessaging::PostQuitMessage;
 
@@ -853,7 +968,6 @@ mod tests {
         assert!(drain_thread_messages(&mut msg).quit);
         clear_message_queue();
     }
-
     #[test]
     fn should_block_registered_mouse_hotkey() {
         use crate::types::Hotkey;
@@ -1092,5 +1206,65 @@ mod tests {
             adoptable_modifiers(tracked, physical, true),
             Modifiers::empty()
         );
+    }
+    #[test]
+    fn spawn_returns_error_when_keyboard_hook_install_fails() {
+        let ops = test_hooks::FakeHookOps::keyboard_failure();
+        let result = spawn_with_hook_ops(None, Box::new(ops));
+        assert!(matches!(
+            result,
+            Err(Error::Platform(message)) if message.contains("keyboard hook")
+        ));
+    }
+
+    #[test]
+    fn spawn_returns_error_when_mouse_hook_install_fails_and_cleans_keyboard_hook() {
+        let unhook_count = Arc::new(AtomicUsize::new(0));
+        let ops = test_hooks::FakeHookOps::mouse_failure(Arc::clone(&unhook_count));
+        let result = spawn_with_hook_ops(None, Box::new(ops));
+        assert!(matches!(
+            result,
+            Err(Error::Platform(message)) if message.contains("mouse hook")
+        ));
+        assert_eq!(unhook_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn install_hooks_unhooks_keyboard_when_mouse_install_fails() {
+        let unhook_count = Arc::new(AtomicUsize::new(0));
+        let mut ops = test_hooks::FakeHookOps::mouse_failure(Arc::clone(&unhook_count));
+        let result = install_hooks(&mut ops);
+        assert!(matches!(
+            result,
+            Err(Error::Platform(message)) if message.contains("mouse hook")
+        ));
+        assert_eq!(unhook_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn reinstall_hooks_replaces_the_old_pair_only_after_both_replacements_install() {
+        let unhook_count = Arc::new(AtomicUsize::new(0));
+        let mut ops = test_hooks::FakeHookOps::success(Arc::clone(&unhook_count));
+        let mut hooks = install_hooks(&mut ops).unwrap();
+
+        reinstall_hooks(&mut hooks, &mut ops).unwrap();
+
+        assert_eq!(unhook_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn reinstall_hooks_keeps_the_old_pair_when_a_replacement_fails() {
+        let unhook_count = Arc::new(AtomicUsize::new(0));
+        let mut initial_ops = test_hooks::FakeHookOps::success(Arc::clone(&unhook_count));
+        let mut hooks = install_hooks(&mut initial_ops).unwrap();
+        let old_keyboard = hooks.keyboard;
+        let old_mouse = hooks.mouse;
+        let mut failing_ops = test_hooks::FakeHookOps::mouse_failure(Arc::clone(&unhook_count));
+
+        assert!(reinstall_hooks(&mut hooks, &mut failing_ops).is_err());
+
+        assert_eq!(hooks.keyboard, old_keyboard);
+        assert_eq!(hooks.mouse, old_mouse);
+        assert_eq!(unhook_count.load(Ordering::SeqCst), 1);
     }
 }
