@@ -1,0 +1,29 @@
+# Keep text files LF across platforms.
+* text=auto eol=lf
+
+# Common binary/archive/media assets.
+*.uasset binary -diff
+*.umap binary -diff
+*.ubulk binary -diff
+*.uexp binary -diff
+*.uptnl binary -diff
+*.dll binary -diff
+*.dylib binary -diff
+*.so binary -diff
+*.so.* binary -diff
+*.lib binary -diff
+*.a binary -diff
+*.zip binary -diff
+*.7z binary -diff
+*.tgz binary -diff
+*.png binary -diff
+*.jpg binary -diff
+*.jpeg binary -diff
+*.gif binary -diff
+*.ico binary -diff
+*.icns binary -diff
+*.mp4 binary -diff
+*.mov binary -diff
+*.wav binary -diff
+*.mp3 binary -diff
+*.onnx binary -diff
