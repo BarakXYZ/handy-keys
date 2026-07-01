@@ -29,6 +29,7 @@ mod vk {
     pub const UP: u16 = 0x26;
     pub const RIGHT: u16 = 0x27;
     pub const DOWN: u16 = 0x28;
+    pub const SNAPSHOT: u16 = 0x2C; // Print Screen
     pub const INSERT: u16 = 0x2D;
     pub const DELETE: u16 = 0x2E;
 
@@ -325,6 +326,7 @@ fn vk_to_key(vk_code: u16, is_extended: bool) -> Option<Key> {
         vk::SPACE => Some(Key::Space),
         vk::PRIOR => Some(Key::PageUp),
         vk::NEXT => Some(Key::PageDown),
+        vk::SNAPSHOT => Some(Key::PrintScreen),
         vk::END => Some(Key::End),
         vk::HOME => Some(Key::Home),
         vk::LEFT => Some(Key::LeftArrow),
@@ -377,7 +379,6 @@ pub fn vk_to_modifier(vk_code: u16) -> Option<Modifiers> {
         _ => None,
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,6 +477,11 @@ mod tests {
         assert_eq!(map_key(vk::F22, 0, false), Some(Key::F22));
         assert_eq!(map_key(vk::F23, 0, false), Some(Key::F23));
         assert_eq!(map_key(vk::F24, 0, false), Some(Key::F24));
+    }
+
+    #[test]
+    fn print_screen_maps_through_the_listener_entrypoint() {
+        assert_eq!(map_key(vk::SNAPSHOT, 0, true), Some(Key::PrintScreen));
     }
 
     #[test]

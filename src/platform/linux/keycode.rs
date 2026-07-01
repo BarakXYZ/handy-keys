@@ -87,6 +87,11 @@ pub fn key_code_to_key(code: KeyCode) -> Option<Key> {
         KeyCode::KEY_ESC => Some(Key::Escape),
         KeyCode::KEY_BACKSPACE => Some(Key::Delete),
         KeyCode::KEY_DELETE => Some(Key::ForwardDelete),
+        // Most PC keyboards report the Print Screen / SysRq key as
+        // KEY_SYSRQ; KEY_PRINT is the separate consumer "AC Print" usage.
+        // Accept both so existing rdev-era bindings and unusual hardware
+        // remain portable through the evdev backend.
+        KeyCode::KEY_SYSRQ | KeyCode::KEY_PRINT => Some(Key::PrintScreen),
         KeyCode::KEY_INSERT => Some(Key::Insert),
         KeyCode::KEY_HOME => Some(Key::Home),
         KeyCode::KEY_END => Some(Key::End),
@@ -180,6 +185,12 @@ mod tests {
         assert_eq!(key_code_to_key(KeyCode::KEY_SPACE), Some(Key::Space));
         assert_eq!(key_code_to_key(KeyCode::KEY_ENTER), Some(Key::Return));
         assert_eq!(key_code_to_key(KeyCode::KEY_INSERT), Some(Key::Insert));
+    }
+
+    #[test]
+    fn maps_print_screen_and_consumer_print_codes() {
+        assert_eq!(key_code_to_key(KeyCode::KEY_SYSRQ), Some(Key::PrintScreen));
+        assert_eq!(key_code_to_key(KeyCode::KEY_PRINT), Some(Key::PrintScreen));
     }
 
     #[test]

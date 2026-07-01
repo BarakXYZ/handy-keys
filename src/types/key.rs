@@ -91,6 +91,7 @@ pub enum Key {
     Escape,
     Delete,
     ForwardDelete,
+    PrintScreen,
     Insert,
     Home,
     End,
@@ -245,6 +246,7 @@ impl fmt::Display for Key {
             Key::Escape => write!(f, "Escape"),
             Key::Delete => write!(f, "Delete"),
             Key::ForwardDelete => write!(f, "ForwardDelete"),
+            Key::PrintScreen => write!(f, "PrintScreen"),
             Key::Insert => write!(f, "Insert"),
             Key::Home => write!(f, "Home"),
             Key::End => write!(f, "End"),
@@ -388,6 +390,8 @@ impl FromStr for Key {
             "escape" | "esc" => Ok(Key::Escape),
             "delete" | "backspace" => Ok(Key::Delete),
             "forwarddelete" | "del" => Ok(Key::ForwardDelete),
+            "printscreen" | "print screen" | "print_screen" | "prtsc" | "printscr"
+            | "printscrn" | "snapshot" => Ok(Key::PrintScreen),
             "insert" | "ins" => Ok(Key::Insert),
             "home" => Ok(Key::Home),
             "end" => Ok(Key::End),
@@ -498,6 +502,20 @@ mod tests {
         assert_eq!("esc".parse::<Key>().unwrap(), Key::Escape);
         assert_eq!("Delete".parse::<Key>().unwrap(), Key::Delete);
         assert_eq!("backspace".parse::<Key>().unwrap(), Key::Delete);
+    }
+
+    #[test]
+    fn parse_print_screen_aliases() {
+        for alias in [
+            "PrintScreen",
+            "printscreen",
+            "print_screen",
+            "prtsc",
+            "snapshot",
+        ] {
+            let key = alias.parse::<Key>().unwrap();
+            assert_eq!(key.to_string(), "PrintScreen");
+        }
     }
 
     #[test]
