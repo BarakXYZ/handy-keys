@@ -94,6 +94,7 @@ pub fn release_events(tracked: Modifiers, stale: Modifiers) -> Vec<KeyEvent> {
                 key: None,
                 is_key_down: false,
                 changed_modifier: Some(modifier),
+                activity: None,
             });
         }
     }

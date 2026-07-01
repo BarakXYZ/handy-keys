@@ -63,7 +63,7 @@ use evdev::{
 use crate::error::{Error, Result};
 use crate::platform::state::{release_events, stale_modifiers, RECONCILABLE};
 use crate::platform::state::{BlockingHotkeys, ListenerState};
-use crate::types::{Key, KeyEvent, Modifiers};
+use crate::types::{InputActivity, Key, KeyEvent, Modifiers, MouseButtonActivity};
 
 use super::keycode::{key_code_to_key, key_code_to_modifier};
 
@@ -692,6 +692,12 @@ fn drain_device(
                                 device.pending.push(event);
                             }
                         }
+                        EventSummary::RelativeAxis(_, code, value) => {
+                            process_relative_axis(state, code, value);
+                            if device.output.is_some() {
+                                device.pending.push(event);
+                            }
+                        }
                         // MSC_SCAN and friends: forward within the batch.
                         _ => {
                             if device.output.is_some() {
@@ -755,6 +761,7 @@ fn process_key(state: &mut LinuxState, code: KeyCode, value: i32) -> bool {
                 key: None,
                 is_key_down,
                 changed_modifier: Some(changed_modifier),
+                activity: None,
             });
         }
 
@@ -785,6 +792,12 @@ fn process_key(state: &mut LinuxState, code: KeyCode, value: i32) -> bool {
     let Some(key) = key_code_to_key(code) else {
         return false;
     };
+
+    if value == KEY_PRESSED {
+        if let Some(button) = mouse_button_activity(key) {
+            emit_activity(state, InputActivity::MouseButtonDown(button));
+        }
+    }
 
     // The press decides; repeats and the release follow it, so the
     // re-injected stream never carries an orphan repeat or key-up.
@@ -817,9 +830,48 @@ fn process_key(state: &mut LinuxState, code: KeyCode, value: i32) -> bool {
         key: Some(key),
         is_key_down,
         changed_modifier: None,
+        activity: None,
     });
 
     block
+}
+
+/// Report non-bindable activity without changing the evdev forwarding or
+/// blocking decision. Tap-alone recognition consumes these events solely as
+/// interruption signals.
+fn emit_activity(state: &LinuxState, activity: InputActivity) {
+    let _ = state.listener.event_sender.send(KeyEvent {
+        modifiers: state.listener.current_modifiers,
+        key: None,
+        is_key_down: true,
+        changed_modifier: None,
+        activity: Some(activity),
+    });
+}
+
+fn process_relative_axis(state: &LinuxState, code: RelativeAxisCode, value: i32) {
+    if value != 0
+        && matches!(
+            code,
+            RelativeAxisCode::REL_WHEEL
+                | RelativeAxisCode::REL_HWHEEL
+                | RelativeAxisCode::REL_WHEEL_HI_RES
+                | RelativeAxisCode::REL_HWHEEL_HI_RES
+        )
+    {
+        emit_activity(state, InputActivity::ScrollWheel);
+    }
+}
+
+fn mouse_button_activity(key: Key) -> Option<MouseButtonActivity> {
+    match key {
+        Key::MouseLeft => Some(MouseButtonActivity::Left),
+        Key::MouseRight => Some(MouseButtonActivity::Right),
+        Key::MouseMiddle => Some(MouseButtonActivity::Middle),
+        Key::MouseX1 => Some(MouseButtonActivity::X1),
+        Key::MouseX2 => Some(MouseButtonActivity::X2),
+        _ => None,
+    }
 }
 
 /// Try to open a device node that just appeared (or became accessible) in
@@ -1034,15 +1086,27 @@ mod tests {
         let (mut state, rx) = state_and_receiver();
 
         process_key(&mut state, KeyCode::BTN_LEFT, KEY_PRESSED);
+        let activity = recv_event(&rx);
+        assert_eq!(
+            activity.activity,
+            Some(InputActivity::MouseButtonDown(MouseButtonActivity::Left))
+        );
+        assert_eq!(activity.key, None);
         assert!(rx.try_recv().is_err());
 
         process_key(&mut state, KeyCode::KEY_LEFTSHIFT, KEY_PRESSED);
         let _ = recv_event(&rx);
 
         process_key(&mut state, KeyCode::BTN_LEFT, KEY_PRESSED);
+        let activity = recv_event(&rx);
+        assert_eq!(
+            activity.activity,
+            Some(InputActivity::MouseButtonDown(MouseButtonActivity::Left))
+        );
         let event = recv_event(&rx);
         assert_eq!(event.key, Some(Key::MouseLeft));
         assert_eq!(event.modifiers, Modifiers::SHIFT_LEFT);
+        assert_eq!(event.activity, None);
     }
 
     #[test]
@@ -1050,9 +1114,36 @@ mod tests {
         let (mut state, rx) = state_and_receiver();
 
         process_key(&mut state, KeyCode::BTN_SIDE, KEY_PRESSED);
+        let activity = recv_event(&rx);
+        assert_eq!(
+            activity.activity,
+            Some(InputActivity::MouseButtonDown(MouseButtonActivity::X1))
+        );
         let event = recv_event(&rx);
         assert_eq!(event.key, Some(Key::MouseX1));
         assert_eq!(event.modifiers, Modifiers::empty());
+        assert_eq!(event.activity, None);
+    }
+
+    #[test]
+    fn wheel_axes_emit_internal_activity_without_bindable_events() {
+        let (state, rx) = state_and_receiver();
+
+        for code in [
+            RelativeAxisCode::REL_WHEEL,
+            RelativeAxisCode::REL_HWHEEL,
+            RelativeAxisCode::REL_WHEEL_HI_RES,
+            RelativeAxisCode::REL_HWHEEL_HI_RES,
+        ] {
+            process_relative_axis(&state, code, 1);
+            let event = recv_event(&rx);
+            assert_eq!(event.activity, Some(InputActivity::ScrollWheel));
+            assert_eq!(event.key, None);
+        }
+
+        process_relative_axis(&state, RelativeAxisCode::REL_X, 1);
+        process_relative_axis(&state, RelativeAxisCode::REL_WHEEL, 0);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

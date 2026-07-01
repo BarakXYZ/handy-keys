@@ -1,18 +1,22 @@
 //! Platform-agnostic hotkey manager built on top of KeyboardListener
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::listener::{BlockingHotkeys, KeyboardListener};
+use crate::tap_alone::TapAloneRecognizer;
 use crate::tap_pattern::TapPatternRecognizer;
 use crate::types::{
-    HandyKeysEvent, Hotkey, HotkeyEvent, HotkeyId, HotkeyState, KeyEvent, TapPattern,
-    TapPatternEvent, TapPatternId,
+    HandyKeysEvent, Hotkey, HotkeyEvent, HotkeyId, HotkeyState, KeyEvent, TapAlone, TapAloneEvent,
+    TapAloneId, TapPattern, TapPatternEvent, TapPatternId,
 };
+
+const RECV_TIMEOUT: Duration = Duration::from_millis(100);
+const EVENT_BUFFER_LIMIT: usize = 1024;
 
 /// Internal state shared between the manager and the processing thread
 struct ManagerState {
@@ -21,6 +25,13 @@ struct ManagerState {
     /// Track which hotkeys are currently pressed
     pressed_hotkeys: HashSet<HotkeyId>,
     tap_patterns: TapPatternRecognizer,
+    tap_alones: TapAloneRecognizer,
+}
+
+struct ProcessedEvents {
+    tap_alone_events: Vec<TapAloneEvent>,
+    hotkey_events: Vec<HotkeyEvent>,
+    tap_events: Vec<TapPatternEvent>,
 }
 
 impl ManagerState {
@@ -30,11 +41,16 @@ impl ManagerState {
             next_id: 0,
             pressed_hotkeys: HashSet::new(),
             tap_patterns: TapPatternRecognizer::new(),
+            tap_alones: TapAloneRecognizer::new(),
         }
     }
 
     /// Process a key event and return any matching hotkey events
     fn process_event(&mut self, event: &KeyEvent) -> Vec<HotkeyEvent> {
+        if event.activity.is_some() {
+            return Vec::new();
+        }
+
         let mut results = Vec::new();
 
         if event.is_key_down {
@@ -87,14 +103,15 @@ impl ManagerState {
         results
     }
 
-    fn process_all_events(
-        &mut self,
-        event: &KeyEvent,
-        now: Instant,
-    ) -> (Vec<HotkeyEvent>, Vec<TapPatternEvent>) {
+    fn process_all_events(&mut self, event: &KeyEvent, now: Instant) -> ProcessedEvents {
+        let tap_alone_events = self.tap_alones.process_event_at(event, now);
         let hotkey_events = self.process_event(event);
         let tap_events = self.tap_patterns.process_event_at(event, now);
-        (hotkey_events, tap_events)
+        ProcessedEvents {
+            tap_alone_events,
+            hotkey_events,
+            tap_events,
+        }
     }
 }
 
@@ -108,8 +125,8 @@ impl ManagerState {
 /// (non-blocked keystrokes are re-injected through it).
 pub struct HotkeyManager {
     state: Arc<Mutex<ManagerState>>,
-    event_receiver: Receiver<HotkeyEvent>,
-    tap_event_receiver: Receiver<TapPatternEvent>,
+    event_receiver: Receiver<HandyKeysEvent>,
+    event_buffer: Mutex<VecDeque<HandyKeysEvent>>,
     _thread_handle: Option<JoinHandle<()>>,
     running: Arc<std::sync::atomic::AtomicBool>,
     /// Shared set of hotkeys to block
@@ -123,8 +140,7 @@ impl HotkeyManager {
     pub fn new() -> Result<Self> {
         let listener = KeyboardListener::new()?;
 
-        let (tx, rx) = mpsc::channel();
-        let (tap_tx, tap_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
         let state = Arc::new(Mutex::new(ManagerState::new()));
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
@@ -132,13 +148,13 @@ impl HotkeyManager {
         let thread_running = Arc::clone(&running);
 
         let handle = thread::spawn(move || {
-            Self::event_loop(listener, thread_state, tx, tap_tx, thread_running);
+            Self::event_loop(listener, thread_state, event_tx, thread_running);
         });
 
         Ok(Self {
             state,
-            event_receiver: rx,
-            tap_event_receiver: tap_rx,
+            event_receiver: event_rx,
+            event_buffer: Mutex::new(VecDeque::new()),
             _thread_handle: Some(handle),
             running,
             blocking_hotkeys: None,
@@ -156,8 +172,7 @@ impl HotkeyManager {
         let blocking_hotkeys: BlockingHotkeys = Arc::new(Mutex::new(HashSet::new()));
         let listener = KeyboardListener::new_with_blocking(blocking_hotkeys.clone())?;
 
-        let (tx, rx) = mpsc::channel();
-        let (tap_tx, tap_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
         let state = Arc::new(Mutex::new(ManagerState::new()));
         let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
@@ -165,13 +180,13 @@ impl HotkeyManager {
         let thread_running = Arc::clone(&running);
 
         let handle = thread::spawn(move || {
-            Self::event_loop(listener, thread_state, tx, tap_tx, thread_running);
+            Self::event_loop(listener, thread_state, event_tx, thread_running);
         });
 
         Ok(Self {
             state,
-            event_receiver: rx,
-            tap_event_receiver: tap_rx,
+            event_receiver: event_rx,
+            event_buffer: Mutex::new(VecDeque::new()),
             _thread_handle: Some(handle),
             running,
             blocking_hotkeys: Some(blocking_hotkeys),
@@ -182,35 +197,36 @@ impl HotkeyManager {
     fn event_loop(
         listener: KeyboardListener,
         state: Arc<Mutex<ManagerState>>,
-        sender: Sender<HotkeyEvent>,
-        tap_sender: Sender<TapPatternEvent>,
+        sender: Sender<HandyKeysEvent>,
         running: Arc<std::sync::atomic::AtomicBool>,
     ) {
-        const RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
-
         while running.load(std::sync::atomic::Ordering::SeqCst) {
+            let timeout = if let Ok(mut state) = state.lock() {
+                let now = Instant::now();
+                if !drain_expired_tap_alones(&mut state, &sender, now) {
+                    return;
+                }
+                recv_timeout_for_state(&state, now)
+            } else {
+                RECV_TIMEOUT
+            };
+
             // Block until we receive an event or timeout (to check running flag)
-            match listener.recv_timeout(RECV_TIMEOUT) {
+            match listener.recv_timeout(timeout) {
                 Ok(key_event) => {
                     if let Ok(mut state) = state.lock() {
-                        let (hotkey_events, tap_events) =
-                            state.process_all_events(&key_event, Instant::now());
-                        for event in hotkey_events {
-                            if sender.send(event).is_err() {
-                                // Receiver dropped, exit
-                                return;
-                            }
-                        }
-                        for event in tap_events {
-                            if tap_sender.send(event).is_err() {
-                                // Receiver dropped, exit
-                                return;
-                            }
+                        let events = state.process_all_events(&key_event, Instant::now());
+                        if !send_processed_events(events, &sender) {
+                            return;
                         }
                     }
                 }
                 Err(crate::error::Error::Timeout) => {
-                    // No event received, loop continues to check running flag
+                    if let Ok(mut state) = state.lock() {
+                        if !drain_expired_tap_alones(&mut state, &sender, Instant::now()) {
+                            return;
+                        }
+                    }
                 }
                 Err(_) => {
                     // Listener disconnected, exit
@@ -299,19 +315,134 @@ impl HotkeyManager {
         state.tap_patterns.get(id)
     }
 
-    /// Blocking receive for hotkey events
-    ///
-    /// Blocks until a hotkey event is received or the event loop stops.
-    pub fn recv(&self) -> Result<HotkeyEvent> {
-        self.event_receiver
-            .recv()
-            .map_err(|_| Error::EventLoopNotRunning)
+    /// Register a tap-alone trigger and return its unique ID.
+    pub fn register_tap_alone(&self, pattern: TapAlone) -> Result<TapAloneId> {
+        let mut state = self.state.lock().map_err(|_| Error::MutexPoisoned)?;
+        state.tap_alones.register(pattern)
     }
 
-    /// Non-blocking receive for hotkey events
+    /// Unregister a tap-alone trigger by its ID.
+    pub fn unregister_tap_alone(&self, id: TapAloneId) -> Result<()> {
+        let mut state = self.state.lock().map_err(|_| Error::MutexPoisoned)?;
+        state.tap_alones.unregister(id)
+    }
+
+    /// Get the tap-alone definition associated with an ID.
+    pub fn get_tap_alone(&self, id: TapAloneId) -> Option<TapAlone> {
+        let state = self.state.lock().ok()?;
+        state.tap_alones.get(id)
+    }
+
+    /// Blocking receive for hotkey events.
+    ///
+    /// Blocks until a hotkey event is received or the event loop stops.
+    /// Other event kinds observed while waiting are preserved in a bounded
+    /// ordered buffer for other receive APIs. Use `try_recv_event` when every
+    /// event kind must be consumed without filtering.
+    pub fn recv(&self) -> Result<HotkeyEvent> {
+        if let Some(event) = self.pop_buffered_hotkey() {
+            return Ok(event);
+        }
+        loop {
+            match self.recv_event()? {
+                HandyKeysEvent::Hotkey(event) => return Ok(event),
+                event => self.buffer_event(event),
+            }
+        }
+    }
+
+    /// Non-blocking receive for hotkey events.
     ///
     /// Returns `Some(event)` if an event is available, `None` otherwise.
+    /// Other event kinds observed while searching are preserved in a bounded
+    /// ordered buffer for other receive APIs.
     pub fn try_recv(&self) -> Option<HotkeyEvent> {
+        if let Some(event) = self.pop_buffered_hotkey() {
+            return Some(event);
+        }
+        loop {
+            match self.try_recv_raw_event() {
+                Some(HandyKeysEvent::Hotkey(event)) => return Some(event),
+                Some(event) => self.buffer_event(event),
+                None => return None,
+            }
+        }
+    }
+
+    /// Blocking receive for tap-pattern events.
+    ///
+    /// Other event kinds observed while waiting are preserved in a bounded
+    /// ordered buffer for other receive APIs.
+    pub fn recv_tap_pattern(&self) -> Result<TapPatternEvent> {
+        if let Some(event) = self.pop_buffered_tap_pattern() {
+            return Ok(event);
+        }
+        loop {
+            match self.recv_event()? {
+                HandyKeysEvent::TapPattern(event) => return Ok(event),
+                event => self.buffer_event(event),
+            }
+        }
+    }
+
+    /// Non-blocking receive for tap-pattern events.
+    ///
+    /// Other event kinds observed while searching are preserved in a bounded
+    /// ordered buffer for other receive APIs.
+    pub fn try_recv_tap_pattern(&self) -> Option<TapPatternEvent> {
+        if let Some(event) = self.pop_buffered_tap_pattern() {
+            return Some(event);
+        }
+        loop {
+            match self.try_recv_raw_event() {
+                Some(HandyKeysEvent::TapPattern(event)) => return Some(event),
+                Some(event) => self.buffer_event(event),
+                None => return None,
+            }
+        }
+    }
+
+    /// Blocking receive for tap-alone events.
+    ///
+    /// Other event kinds observed while waiting are preserved in a bounded
+    /// ordered buffer for other receive APIs.
+    pub fn recv_tap_alone(&self) -> Result<TapAloneEvent> {
+        if let Some(event) = self.pop_buffered_tap_alone() {
+            return Ok(event);
+        }
+        loop {
+            match self.recv_event()? {
+                HandyKeysEvent::TapAlone(event) => return Ok(event),
+                event => self.buffer_event(event),
+            }
+        }
+    }
+
+    /// Non-blocking receive for tap-alone events.
+    ///
+    /// Other event kinds observed while searching are preserved in a bounded
+    /// ordered buffer for other receive APIs.
+    pub fn try_recv_tap_alone(&self) -> Option<TapAloneEvent> {
+        if let Some(event) = self.pop_buffered_tap_alone() {
+            return Some(event);
+        }
+        loop {
+            match self.try_recv_raw_event() {
+                Some(HandyKeysEvent::TapAlone(event)) => return Some(event),
+                Some(event) => self.buffer_event(event),
+                None => return None,
+            }
+        }
+    }
+
+    /// Non-blocking receive for any HandyKeys event.
+    ///
+    /// Typed receivers remain available independently. This convenience method
+    /// reads from the ordered multiplexed event queue used by native bridges.
+    pub fn try_recv_event(&self) -> Option<HandyKeysEvent> {
+        if let Some(event) = self.pop_buffered_event() {
+            return Some(event);
+        }
         match self.event_receiver.try_recv() {
             Ok(event) => Some(event),
             Err(TryRecvError::Empty) => None,
@@ -319,30 +450,61 @@ impl HotkeyManager {
         }
     }
 
-    /// Blocking receive for tap-pattern events.
-    pub fn recv_tap_pattern(&self) -> Result<TapPatternEvent> {
-        self.tap_event_receiver
+    fn recv_event(&self) -> Result<HandyKeysEvent> {
+        self.event_receiver
             .recv()
             .map_err(|_| Error::EventLoopNotRunning)
     }
 
-    /// Non-blocking receive for tap-pattern events.
-    pub fn try_recv_tap_pattern(&self) -> Option<TapPatternEvent> {
-        match self.tap_event_receiver.try_recv() {
+    fn try_recv_raw_event(&self) -> Option<HandyKeysEvent> {
+        match self.event_receiver.try_recv() {
             Ok(event) => Some(event),
             Err(TryRecvError::Empty) => None,
             Err(TryRecvError::Disconnected) => None,
         }
     }
 
-    /// Non-blocking receive for any HandyKeys event.
-    ///
-    /// Existing typed receivers remain the source of truth. This convenience
-    /// method checks hotkey events before tap-pattern events.
-    pub fn try_recv_event(&self) -> Option<HandyKeysEvent> {
-        self.try_recv()
-            .map(HandyKeysEvent::Hotkey)
-            .or_else(|| self.try_recv_tap_pattern().map(HandyKeysEvent::TapPattern))
+    fn buffer_event(&self, event: HandyKeysEvent) {
+        if let Ok(mut buffer) = self.event_buffer.lock() {
+            if buffer.len() >= EVENT_BUFFER_LIMIT {
+                buffer.pop_front();
+            }
+            buffer.push_back(event);
+        }
+    }
+
+    fn pop_buffered_event(&self) -> Option<HandyKeysEvent> {
+        self.event_buffer
+            .lock()
+            .ok()
+            .and_then(|mut buffer| buffer.pop_front())
+    }
+
+    fn pop_buffered_hotkey(&self) -> Option<HotkeyEvent> {
+        self.pop_buffered_matching(|event| match event {
+            HandyKeysEvent::Hotkey(event) => Some(event),
+            _ => None,
+        })
+    }
+
+    fn pop_buffered_tap_pattern(&self) -> Option<TapPatternEvent> {
+        self.pop_buffered_matching(|event| match event {
+            HandyKeysEvent::TapPattern(event) => Some(event),
+            _ => None,
+        })
+    }
+
+    fn pop_buffered_tap_alone(&self) -> Option<TapAloneEvent> {
+        self.pop_buffered_matching(|event| match event {
+            HandyKeysEvent::TapAlone(event) => Some(event),
+            _ => None,
+        })
+    }
+
+    fn pop_buffered_matching<T>(&self, matcher: impl Fn(HandyKeysEvent) -> Option<T>) -> Option<T> {
+        let mut buffer = self.event_buffer.lock().ok()?;
+        let index = buffer.iter().position(|event| matcher(*event).is_some())?;
+        buffer.remove(index).and_then(matcher)
     }
 
     /// Get the number of currently registered hotkeys
@@ -364,6 +526,59 @@ impl HotkeyManager {
         };
         state.tap_patterns.count()
     }
+
+    /// Get the number of currently registered tap-alone triggers
+    pub fn tap_alone_count(&self) -> usize {
+        let state = if let Ok(s) = self.state.lock() {
+            s
+        } else {
+            return 0;
+        };
+        state.tap_alones.count()
+    }
+}
+
+fn recv_timeout_for_state(state: &ManagerState, now: Instant) -> Duration {
+    state
+        .tap_alones
+        .next_deadline_at()
+        .map(|deadline| deadline.saturating_duration_since(now))
+        .unwrap_or(RECV_TIMEOUT)
+        .min(RECV_TIMEOUT)
+}
+
+fn drain_expired_tap_alones(
+    state: &mut ManagerState,
+    sender: &Sender<HandyKeysEvent>,
+    now: Instant,
+) -> bool {
+    send_tap_alone_events(state.tap_alones.drain_expired_at(now), sender)
+}
+
+fn send_processed_events(events: ProcessedEvents, sender: &Sender<HandyKeysEvent>) -> bool {
+    if !send_tap_alone_events(events.tap_alone_events, sender) {
+        return false;
+    }
+    for event in events.hotkey_events {
+        if sender.send(HandyKeysEvent::Hotkey(event)).is_err() {
+            return false;
+        }
+    }
+    for event in events.tap_events {
+        if sender.send(HandyKeysEvent::TapPattern(event)).is_err() {
+            return false;
+        }
+    }
+    true
+}
+
+fn send_tap_alone_events(events: Vec<TapAloneEvent>, sender: &Sender<HandyKeysEvent>) -> bool {
+    for event in events {
+        if sender.send(HandyKeysEvent::TapAlone(event)).is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 impl Drop for HotkeyManager {
@@ -380,7 +595,9 @@ impl Drop for HotkeyManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Key, Modifiers, TapPattern, TriggerKey};
+    use crate::types::{
+        InputActivity, Key, Modifiers, MouseButtonActivity, TapAlone, TapPattern, TriggerKey,
+    };
     use std::time::{Duration, Instant};
 
     fn make_key_event(modifiers: Modifiers, key: Option<Key>, is_key_down: bool) -> KeyEvent {
@@ -389,6 +606,7 @@ mod tests {
             key,
             is_key_down,
             changed_modifier: None,
+            activity: None,
         }
     }
 
@@ -402,6 +620,17 @@ mod tests {
             key: None,
             is_key_down,
             changed_modifier: Some(changed),
+            activity: None,
+        }
+    }
+
+    fn make_activity_event(modifiers: Modifiers, activity: InputActivity) -> KeyEvent {
+        KeyEvent {
+            modifiers,
+            key: None,
+            is_key_down: true,
+            changed_modifier: None,
+            activity: Some(activity),
         }
     }
 
@@ -744,13 +973,15 @@ mod tests {
             let first_up = make_key_event(Modifiers::empty(), Some(Key::D), false);
             let second_down = make_key_event(Modifiers::empty(), Some(Key::D), true);
 
-            assert!(state.process_all_events(&first_down, start).1.is_empty());
+            assert!(state
+                .process_all_events(&first_down, start)
+                .tap_events
+                .is_empty());
             state.process_all_events(&first_up, start + Duration::from_millis(10));
-            let (_, tap_events) =
-                state.process_all_events(&second_down, start + Duration::from_millis(50));
+            let events = state.process_all_events(&second_down, start + Duration::from_millis(50));
 
             assert_eq!(
-                tap_events,
+                events.tap_events,
                 vec![TapPatternEvent {
                     id,
                     tap_count: 2,
@@ -758,5 +989,265 @@ mod tests {
                 }]
             );
         }
+
+        #[test]
+        fn tap_alone_registration_lookup_and_unregister() {
+            let mut state = ManagerState::new();
+            let pattern = TapAlone::new(
+                TriggerKey::Key(Key::D),
+                Duration::from_millis(1000),
+                Duration::from_millis(250),
+            )
+            .unwrap();
+
+            let id = state.tap_alones.register(pattern).unwrap();
+            assert_eq!(state.tap_alones.get(id), Some(pattern));
+            assert_eq!(state.tap_alones.count(), 1);
+
+            state.tap_alones.unregister(id).unwrap();
+            assert_eq!(state.tap_alones.count(), 0);
+        }
+
+        #[test]
+        fn process_all_events_includes_tap_alone_events_after_deadline() {
+            let mut state = ManagerState::new();
+            let id = state
+                .tap_alones
+                .register(
+                    TapAlone::new(
+                        TriggerKey::Key(Key::D),
+                        Duration::from_millis(1000),
+                        Duration::from_millis(250),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let start = Instant::now();
+
+            state.process_all_events(
+                &make_key_event(Modifiers::empty(), Some(Key::D), true),
+                start,
+            );
+            state.process_all_events(
+                &make_key_event(Modifiers::empty(), Some(Key::D), false),
+                start + Duration::from_millis(40),
+            );
+
+            assert_eq!(
+                state
+                    .tap_alones
+                    .drain_expired_at(start + Duration::from_millis(290)),
+                vec![TapAloneEvent { id }]
+            );
+        }
+
+        #[test]
+        fn process_all_events_drains_expired_tap_alone_before_new_event() {
+            let mut state = ManagerState::new();
+            let id = state
+                .tap_alones
+                .register(
+                    TapAlone::new(
+                        TriggerKey::Key(Key::D),
+                        Duration::from_millis(1000),
+                        Duration::from_millis(250),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let start = Instant::now();
+
+            state.process_all_events(
+                &make_key_event(Modifiers::empty(), Some(Key::D), true),
+                start,
+            );
+            state.process_all_events(
+                &make_key_event(Modifiers::empty(), Some(Key::D), false),
+                start + Duration::from_millis(20),
+            );
+            let events = state.process_all_events(
+                &make_key_event(Modifiers::empty(), Some(Key::D), true),
+                start + Duration::from_millis(300),
+            );
+
+            assert_eq!(events.tap_alone_events, vec![TapAloneEvent { id }]);
+        }
+
+        #[test]
+        fn ordered_queue_sends_expired_tap_alone_before_current_hotkey() {
+            let mut state = ManagerState::new();
+            let hotkey_id = HotkeyId(7);
+            state
+                .hotkeys
+                .insert(hotkey_id, Hotkey::new(Modifiers::empty(), Key::D).unwrap());
+            let tap_alone_id = state
+                .tap_alones
+                .register(
+                    TapAlone::new(
+                        TriggerKey::Key(Key::D),
+                        Duration::from_millis(1000),
+                        Duration::from_millis(250),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let start = Instant::now();
+
+            state.process_all_events(
+                &make_key_event(Modifiers::empty(), Some(Key::D), true),
+                start,
+            );
+            state.process_all_events(
+                &make_key_event(Modifiers::empty(), Some(Key::D), false),
+                start + Duration::from_millis(20),
+            );
+            let events = state.process_all_events(
+                &make_key_event(Modifiers::empty(), Some(Key::D), true),
+                start + Duration::from_millis(300),
+            );
+
+            let (event_tx, event_rx) = mpsc::channel();
+            assert!(send_processed_events(events, &event_tx));
+
+            assert_eq!(
+                event_rx.try_recv().unwrap(),
+                HandyKeysEvent::TapAlone(TapAloneEvent { id: tap_alone_id })
+            );
+            assert_eq!(
+                event_rx.try_recv().unwrap(),
+                HandyKeysEvent::Hotkey(HotkeyEvent {
+                    id: hotkey_id,
+                    state: HotkeyState::Pressed,
+                })
+            );
+        }
+
+        #[test]
+        fn internal_activity_does_not_trigger_modifier_only_hotkeys() {
+            let mut state = ManagerState::new();
+            let hotkey = Hotkey::new(Modifiers::CTRL_LEFT, None).unwrap();
+            let id = HotkeyId(0);
+            state.hotkeys.insert(id, hotkey);
+
+            let events = state.process_all_events(
+                &make_activity_event(
+                    Modifiers::CTRL_LEFT,
+                    InputActivity::MouseButtonDown(MouseButtonActivity::Left),
+                ),
+                Instant::now(),
+            );
+
+            assert!(events.hotkey_events.is_empty());
+        }
+
+        #[test]
+        fn tap_alone_deadline_timeout_uses_min_deadline_and_recv_timeout() {
+            let start = Instant::now();
+            let mut state = ManagerState::new();
+            state
+                .tap_alones
+                .register(
+                    TapAlone::new(
+                        TriggerKey::Key(Key::D),
+                        Duration::from_millis(1000),
+                        Duration::from_millis(50),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            state.process_all_events(
+                &make_key_event(Modifiers::empty(), Some(Key::D), true),
+                start,
+            );
+            state.process_all_events(
+                &make_key_event(Modifiers::empty(), Some(Key::D), false),
+                start,
+            );
+            assert_eq!(
+                recv_timeout_for_state(&state, start),
+                Duration::from_millis(50)
+            );
+
+            let mut later = ManagerState::new();
+            later
+                .tap_alones
+                .register(
+                    TapAlone::new(
+                        TriggerKey::Key(Key::D),
+                        Duration::from_millis(1000),
+                        Duration::from_millis(250),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            later.process_all_events(
+                &make_key_event(Modifiers::empty(), Some(Key::D), true),
+                start,
+            );
+            later.process_all_events(
+                &make_key_event(Modifiers::empty(), Some(Key::D), false),
+                start,
+            );
+            assert_eq!(recv_timeout_for_state(&later, start), RECV_TIMEOUT);
+        }
+    }
+
+    #[test]
+    fn typed_receive_buffers_unmatched_events_for_generic_receive() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let manager = HotkeyManager {
+            state: Arc::new(Mutex::new(ManagerState::new())),
+            event_receiver: event_rx,
+            event_buffer: Mutex::new(VecDeque::new()),
+            _thread_handle: None,
+            running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            blocking_hotkeys: None,
+        };
+        let hotkey_event = HotkeyEvent {
+            id: HotkeyId(3),
+            state: HotkeyState::Pressed,
+        };
+        let tap_alone_event = TapAloneEvent {
+            id: TapAloneId::from_u32(9),
+        };
+
+        event_tx.send(HandyKeysEvent::Hotkey(hotkey_event)).unwrap();
+        event_tx
+            .send(HandyKeysEvent::TapAlone(tap_alone_event))
+            .unwrap();
+
+        assert_eq!(manager.try_recv_tap_alone(), Some(tap_alone_event));
+        assert_eq!(
+            manager.try_recv_event(),
+            Some(HandyKeysEvent::Hotkey(hotkey_event))
+        );
+        assert_eq!(manager.try_recv_event(), None);
+    }
+
+    #[test]
+    fn typed_receive_unmatched_event_buffer_is_bounded() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let manager = HotkeyManager {
+            state: Arc::new(Mutex::new(ManagerState::new())),
+            event_receiver: event_rx,
+            event_buffer: Mutex::new(VecDeque::new()),
+            _thread_handle: None,
+            running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            blocking_hotkeys: None,
+        };
+
+        for offset in 0..(EVENT_BUFFER_LIMIT + 2) {
+            event_tx
+                .send(HandyKeysEvent::TapAlone(TapAloneEvent {
+                    id: TapAloneId::from_u32(offset as u32),
+                }))
+                .unwrap();
+        }
+
+        assert_eq!(manager.try_recv(), None);
+        assert_eq!(
+            manager.event_buffer.lock().unwrap().len(),
+            EVENT_BUFFER_LIMIT
+        );
     }
 }

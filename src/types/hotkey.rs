@@ -6,6 +6,7 @@ use std::str::FromStr;
 
 use crate::error::{Error, Result};
 
+use super::input_activity::InputActivity;
 use super::key::Key;
 use super::modifiers::Modifiers;
 
@@ -273,6 +274,9 @@ pub struct KeyEvent {
     /// For modifier-only events (FlagsChanged), indicates which modifier changed.
     /// `None` for regular key events.
     pub changed_modifier: Option<Modifiers>,
+    /// Internal input activity that should not be exposed as a bindable key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<InputActivity>,
 }
 
 impl KeyEvent {

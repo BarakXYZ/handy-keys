@@ -20,13 +20,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MsgWaitForMultipleObjects, PeekMessageW, RegisterClassW, SetWindowsHookExW, TranslateMessage,
     UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, MSG, MSLLHOOKSTRUCT, PM_REMOVE,
     QS_ALLINPUT, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_POWERBROADCAST, WM_QUIT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEWHEEL,
+    WM_POWERBROADCAST, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_XBUTTONDOWN,
+    WM_XBUTTONUP, WNDCLASSW,
 };
 
 use crate::error::{Error, Result};
 use crate::platform::state::{release_events, stale_modifiers, BlockingHotkeys, RECONCILABLE};
-use crate::types::{Key, KeyEvent, Modifiers};
+use crate::types::{InputActivity, Key, KeyEvent, Modifiers, MouseButtonActivity};
 
 use super::keycode::{is_altgr_phantom_ctrl, map_key, vk_to_modifier};
 
@@ -623,6 +624,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                         key: None,
                         is_key_down,
                         changed_modifier: Some(modifier),
+                        activity: None,
                     });
                 }
 
@@ -661,6 +663,7 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                         key: Some(key),
                         is_key_down,
                         changed_modifier: None,
+                        activity: None,
                     });
                 }
             }
@@ -691,8 +694,8 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         return CallNextHookEx(None, code, wparam, lparam);
     }
 
-    // Only button transitions matter; bail out early for moves and wheel
-    // events so the hot path stays free of state access.
+    // Only button transitions and wheel activity matter; bail out early for
+    // mouse moves so the hot path stays free of state access.
     if !matches!(
         wparam.0 as u32,
         WM_LBUTTONDOWN
@@ -703,6 +706,8 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
             | WM_MBUTTONUP
             | WM_XBUTTONDOWN
             | WM_XBUTTONUP
+            | WM_MOUSEWHEEL
+            | WM_MOUSEHWHEEL
     ) {
         return CallNextHookEx(None, code, wparam, lparam);
     }
@@ -722,6 +727,34 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
 
             // Only report left/right clicks when modifiers are held (to avoid noise)
             let has_modifiers = !ctx.current_modifiers.is_empty();
+
+            let activity = match wparam.0 as u32 {
+                WM_LBUTTONDOWN => Some(InputActivity::MouseButtonDown(MouseButtonActivity::Left)),
+                WM_RBUTTONDOWN => Some(InputActivity::MouseButtonDown(MouseButtonActivity::Right)),
+                WM_MBUTTONDOWN => Some(InputActivity::MouseButtonDown(MouseButtonActivity::Middle)),
+                WM_XBUTTONDOWN => {
+                    let xbutton = (mouse_struct.mouseData >> 16) & 0xFFFF;
+                    if xbutton == 1 {
+                        Some(InputActivity::MouseButtonDown(MouseButtonActivity::X1))
+                    } else if xbutton == 2 {
+                        Some(InputActivity::MouseButtonDown(MouseButtonActivity::X2))
+                    } else {
+                        None
+                    }
+                }
+                WM_MOUSEWHEEL | WM_MOUSEHWHEEL => Some(InputActivity::ScrollWheel),
+                _ => None,
+            };
+
+            if let Some(activity) = activity {
+                let _ = ctx.event_sender.send(KeyEvent {
+                    modifiers: ctx.current_modifiers,
+                    key: None,
+                    is_key_down: true,
+                    changed_modifier: None,
+                    activity: Some(activity),
+                });
+            }
 
             let (key, is_down) = match wparam.0 as u32 {
                 WM_LBUTTONDOWN if has_modifiers => (Some(Key::MouseLeft), true),
@@ -773,6 +806,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                     key: Some(key),
                     is_key_down: is_down,
                     changed_modifier: None,
+                    activity: None,
                 });
             }
         }

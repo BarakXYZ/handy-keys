@@ -138,16 +138,19 @@ mod error;
 mod listener;
 mod manager;
 mod platform;
+mod tap_alone;
 mod tap_pattern;
 mod types;
 
 pub use error::{Error, Result};
 pub use listener::{BlockingHotkeys, KeyboardListener};
 pub use manager::HotkeyManager;
+pub use tap_alone::TapAloneRecognizer;
 pub use tap_pattern::TapPatternRecognizer;
 pub use types::{
-    HandyKeysEvent, Hotkey, HotkeyEvent, HotkeyId, HotkeyState, Key, KeyEvent, Modifiers,
-    TapPattern, TapPatternEvent, TapPatternId, TapPatternMode, TriggerKey,
+    HandyKeysEvent, Hotkey, HotkeyEvent, HotkeyId, HotkeyState, InputActivity, Key, KeyEvent,
+    Modifiers, MouseButtonActivity, TapAlone, TapAloneEvent, TapAloneId, TapPattern,
+    TapPatternEvent, TapPatternId, TapPatternMode, TriggerKey,
 };
 
 #[cfg(target_os = "macos")]

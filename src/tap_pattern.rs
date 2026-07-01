@@ -191,6 +191,7 @@ mod tests {
             key: Some(key),
             is_key_down,
             changed_modifier: None,
+            activity: None,
         }
     }
 
@@ -204,6 +205,7 @@ mod tests {
             key: None,
             is_key_down,
             changed_modifier: Some(modifier),
+            activity: None,
         }
     }
 

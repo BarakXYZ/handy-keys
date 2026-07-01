@@ -17,7 +17,7 @@ use objc2_core_graphics::{
 
 use crate::error::{Error, Result};
 use crate::platform::state::{BlockingHotkeys, ListenerState};
-use crate::types::{Key, KeyEvent, Modifiers};
+use crate::types::{InputActivity, Key, KeyEvent, Modifiers, MouseButtonActivity};
 
 use super::keycode::{flags_have_alpha_shift, flags_have_fn, keycode_to_key, keycode_to_modifier};
 use super::permissions::check_accessibility;
@@ -238,6 +238,7 @@ unsafe extern "C-unwind" fn event_tap_callback(
                     key,
                     is_key_down: true,
                     changed_modifier: None,
+                    activity: None,
                 });
             }
             CGEventType::KeyUp => {
@@ -261,6 +262,7 @@ unsafe extern "C-unwind" fn event_tap_callback(
                     key,
                     is_key_down: false,
                     changed_modifier: None,
+                    activity: None,
                 });
             }
             CGEventType::FlagsChanged => {
@@ -287,6 +289,7 @@ unsafe extern "C-unwind" fn event_tap_callback(
                         key: Some(key),
                         is_key_down,
                         changed_modifier: None,
+                        activity: None,
                     });
                 } else if let Some(modifier_bit) = changed_modifier {
                     // Regular modifier key — use keycode to toggle the specific bit
@@ -316,6 +319,7 @@ unsafe extern "C-unwind" fn event_tap_callback(
                         key: None,
                         is_key_down,
                         changed_modifier,
+                        activity: None,
                     });
                 } else if keycode == 0x3F {
                     // FN key itself — tracked via flags, not keycode state
@@ -337,18 +341,30 @@ unsafe extern "C-unwind" fn event_tap_callback(
                             key: None,
                             is_key_down: has_fn,
                             changed_modifier: Some(Modifiers::FN),
+                            activity: None,
                         });
                     }
                 }
             }
             // Mouse button events
             // Only report left/right clicks when modifiers are held (to avoid noise)
-            CGEventType::LeftMouseDown if !modifiers.is_empty() => {
+            CGEventType::LeftMouseDown => {
+                let _ = state.event_sender.send(KeyEvent {
+                    modifiers,
+                    key: None,
+                    is_key_down: true,
+                    changed_modifier: None,
+                    activity: Some(InputActivity::MouseButtonDown(MouseButtonActivity::Left)),
+                });
+                if modifiers.is_empty() {
+                    return event.as_ptr();
+                }
                 let _ = state.event_sender.send(KeyEvent {
                     modifiers,
                     key: Some(Key::MouseLeft),
                     is_key_down: true,
                     changed_modifier: None,
+                    activity: None,
                 });
             }
             CGEventType::LeftMouseUp if !modifiers.is_empty() => {
@@ -357,14 +373,26 @@ unsafe extern "C-unwind" fn event_tap_callback(
                     key: Some(Key::MouseLeft),
                     is_key_down: false,
                     changed_modifier: None,
+                    activity: None,
                 });
             }
-            CGEventType::RightMouseDown if !modifiers.is_empty() => {
+            CGEventType::RightMouseDown => {
+                let _ = state.event_sender.send(KeyEvent {
+                    modifiers,
+                    key: None,
+                    is_key_down: true,
+                    changed_modifier: None,
+                    activity: Some(InputActivity::MouseButtonDown(MouseButtonActivity::Right)),
+                });
+                if modifiers.is_empty() {
+                    return event.as_ptr();
+                }
                 let _ = state.event_sender.send(KeyEvent {
                     modifiers,
                     key: Some(Key::MouseRight),
                     is_key_down: true,
                     changed_modifier: None,
+                    activity: None,
                 });
             }
             CGEventType::RightMouseUp if !modifiers.is_empty() => {
@@ -373,30 +401,38 @@ unsafe extern "C-unwind" fn event_tap_callback(
                     key: Some(Key::MouseRight),
                     is_key_down: false,
                     changed_modifier: None,
+                    activity: None,
                 });
             }
-            // Pass through unmodified left/right clicks
-            CGEventType::LeftMouseDown
-            | CGEventType::LeftMouseUp
-            | CGEventType::RightMouseDown
-            | CGEventType::RightMouseUp => {}
+            // Pass through unmodified left/right button releases. Button
+            // presses are handled unconditionally above so they can also
+            // interrupt tap-alone recognition.
+            CGEventType::LeftMouseUp | CGEventType::RightMouseUp => {}
             CGEventType::OtherMouseDown => {
                 let button_number = CGEvent::integer_value_field(
                     Some(cg_event),
                     CGEventField::MouseEventButtonNumber,
                 );
-                let key = match button_number {
-                    2 => Some(Key::MouseMiddle),
-                    3 => Some(Key::MouseX1),
-                    4 => Some(Key::MouseX2),
+                let button = match button_number {
+                    2 => Some((Key::MouseMiddle, MouseButtonActivity::Middle)),
+                    3 => Some((Key::MouseX1, MouseButtonActivity::X1)),
+                    4 => Some((Key::MouseX2, MouseButtonActivity::X2)),
                     _ => None, // Unknown button
                 };
-                if let Some(key) = key {
+                if let Some((key, button)) = button {
+                    let _ = state.event_sender.send(KeyEvent {
+                        modifiers,
+                        key: None,
+                        is_key_down: true,
+                        changed_modifier: None,
+                        activity: Some(InputActivity::MouseButtonDown(button)),
+                    });
                     let _ = state.event_sender.send(KeyEvent {
                         modifiers,
                         key: Some(key),
                         is_key_down: true,
                         changed_modifier: None,
+                        activity: None,
                     });
                 }
             }
@@ -417,11 +453,21 @@ unsafe extern "C-unwind" fn event_tap_callback(
                         key: Some(key),
                         is_key_down: false,
                         changed_modifier: None,
+                        activity: None,
                     });
                 }
             }
             // TapDisabledByTimeout/TapDisabledByUserInput are handled (and
             // returned from) before the state lock above.
+            CGEventType::ScrollWheel => {
+                let _ = state.event_sender.send(KeyEvent {
+                    modifiers,
+                    key: None,
+                    is_key_down: true,
+                    changed_modifier: None,
+                    activity: Some(InputActivity::ScrollWheel),
+                });
+            }
             _ => {}
         }
     }
@@ -451,7 +497,8 @@ fn run_event_tap(
         | (1 << CGEventType::RightMouseDown.0)
         | (1 << CGEventType::RightMouseUp.0)
         | (1 << CGEventType::OtherMouseDown.0)
-        | (1 << CGEventType::OtherMouseUp.0);
+        | (1 << CGEventType::OtherMouseUp.0)
+        | (1 << CGEventType::ScrollWheel.0);
 
     // Callback context, handed to the tap as a raw refcon pointer
     let ctx_ptr = Box::into_raw(Box::new(CallbackCtx {

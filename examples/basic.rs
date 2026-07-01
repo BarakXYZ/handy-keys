@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use handy_keys::{check_accessibility, open_accessibility_settings};
 use handy_keys::{Hotkey, HotkeyManager, HotkeyState, Key, Modifiers, Result};
 use std::io::Write;
 
@@ -19,8 +21,6 @@ fn main() -> Result<()> {
     // Check accessibility permission (macOS only)
     #[cfg(target_os = "macos")]
     {
-        use handy_keys::{check_accessibility, open_accessibility_settings};
-
         let has_access = check_accessibility();
         log(&format!("Accessibility permission check: {}", has_access));
 

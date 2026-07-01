@@ -5,9 +5,7 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 
-use super::hotkey::{Hotkey, HotkeyEvent};
-use super::key::Key;
-use super::modifiers::Modifiers;
+use super::trigger_key::TriggerKey;
 
 /// A unique identifier for a registered tap pattern.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -21,31 +19,6 @@ impl TapPatternId {
 
     pub fn from_u32(id: u32) -> Self {
         Self(id)
-    }
-}
-
-/// One key-like input that can be tapped repeatedly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum TriggerKey {
-    Key(Key),
-    Modifier(Modifiers),
-}
-
-impl TriggerKey {
-    pub fn from_hotkey(hotkey: Hotkey) -> Result<Self> {
-        match (hotkey.modifiers, hotkey.key) {
-            (modifiers, Some(key)) if modifiers.is_empty() => Ok(Self::Key(key)),
-            (modifiers, None) if is_single_concrete_modifier(modifiers) => {
-                Ok(Self::Modifier(modifiers))
-            }
-            (modifiers, None) if !modifiers.is_empty() => Err(Error::InvalidTapPattern(
-                "tap-pattern modifier triggers must be side-specific, e.g. shift_left".to_string(),
-            )),
-            _ => Err(Error::InvalidTapPattern(
-                "tap-pattern triggers must be exactly one key or one side-specific modifier"
-                    .to_string(),
-            )),
-        }
     }
 }
 
@@ -112,56 +85,10 @@ pub struct TapPatternEvent {
     pub is_key_down: bool,
 }
 
-/// Unified event type for callers that want both hotkey and tap-pattern events.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum HandyKeysEvent {
-    Hotkey(HotkeyEvent),
-    TapPattern(TapPatternEvent),
-}
-
-fn is_single_concrete_modifier(modifiers: Modifiers) -> bool {
-    !modifiers.is_empty() && modifiers.bits().count_ones() == 1
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::Key;
     use super::*;
-
-    #[test]
-    fn trigger_accepts_key_only_hotkey() {
-        let hotkey: Hotkey = "d".parse().unwrap();
-        assert_eq!(
-            TriggerKey::from_hotkey(hotkey).unwrap(),
-            TriggerKey::Key(Key::D)
-        );
-    }
-
-    #[test]
-    fn trigger_accepts_side_specific_modifier_only_hotkey() {
-        let hotkey: Hotkey = "shift_left".parse().unwrap();
-        assert_eq!(
-            TriggerKey::from_hotkey(hotkey).unwrap(),
-            TriggerKey::Modifier(Modifiers::SHIFT_LEFT)
-        );
-    }
-
-    #[test]
-    fn trigger_rejects_compound_modifier() {
-        let hotkey: Hotkey = "shift".parse().unwrap();
-        assert!(matches!(
-            TriggerKey::from_hotkey(hotkey),
-            Err(Error::InvalidTapPattern(_))
-        ));
-    }
-
-    #[test]
-    fn trigger_rejects_chord() {
-        let hotkey: Hotkey = "ctrl+d".parse().unwrap();
-        assert!(matches!(
-            TriggerKey::from_hotkey(hotkey),
-            Err(Error::InvalidTapPattern(_))
-        ));
-    }
 
     #[test]
     fn tap_pattern_requires_double_tap_for_mvp() {

@@ -1,4 +1,4 @@
-use crate::types::{HotkeyId, TapPatternId};
+use crate::types::{HotkeyId, TapAloneId, TapPatternId};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -27,6 +27,12 @@ pub enum Error {
     #[error("Tap pattern already registered: {0}")]
     TapPatternAlreadyRegistered(String),
 
+    #[error("Tap-alone trigger with id {0:?} not found")]
+    TapAloneNotFound(TapAloneId),
+
+    #[error("Tap-alone trigger already registered: {0}")]
+    TapAloneAlreadyRegistered(String),
+
     #[error("Event loop not running")]
     EventLoopNotRunning,
 
@@ -47,6 +53,12 @@ pub enum Error {
 
     #[error("Invalid tap pattern: {0}")]
     InvalidTapPattern(String),
+
+    #[error("Invalid tap-alone trigger: {0}")]
+    InvalidTapAlone(String),
+
+    #[error("Invalid trigger key: {0}")]
+    InvalidTriggerKey(String),
 
     #[error("Unknown key: {0}")]
     UnknownKey(String),
