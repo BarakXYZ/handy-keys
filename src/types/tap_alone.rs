@@ -28,6 +28,8 @@ pub struct TapAlone {
     pub trigger: TriggerKey,
     pub max_press_duration: Duration,
     pub double_tap_suppression: Duration,
+    #[serde(default)]
+    pub post_release_interruption_window: Duration,
 }
 
 impl TapAlone {
@@ -57,7 +59,18 @@ impl TapAlone {
             trigger,
             max_press_duration,
             double_tap_suppression,
+            post_release_interruption_window: Duration::ZERO,
         })
+    }
+
+    /// Cancel a pending tap when different input begins shortly after release.
+    ///
+    /// This accommodates input remappers that release a provisional modifier
+    /// before posting the replacement chord. A zero duration preserves the
+    /// default behavior.
+    pub fn with_post_release_interruption_window(mut self, duration: Duration) -> Self {
+        self.post_release_interruption_window = duration;
+        self
     }
 }
 
@@ -106,6 +119,23 @@ mod tests {
         assert_eq!(tap_alone.trigger, trigger);
         assert_eq!(tap_alone.max_press_duration, Duration::from_millis(999));
         assert_eq!(tap_alone.double_tap_suppression, Duration::from_millis(251));
+        assert_eq!(tap_alone.post_release_interruption_window, Duration::ZERO);
+    }
+
+    #[test]
+    fn tap_alone_configures_post_release_interruption_window() {
+        let tap_alone = TapAlone::new(
+            TriggerKey::Key(Key::D),
+            Duration::from_millis(1000),
+            Duration::from_millis(250),
+        )
+        .unwrap()
+        .with_post_release_interruption_window(Duration::from_millis(30));
+
+        assert_eq!(
+            tap_alone.post_release_interruption_window,
+            Duration::from_millis(30)
+        );
     }
 
     #[test]

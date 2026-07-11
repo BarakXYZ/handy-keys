@@ -1,7 +1,7 @@
 //! Pure tap-alone recognizer.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::types::{
@@ -20,6 +20,7 @@ struct ActivePress {
 struct PendingRelease {
     id: TapAloneId,
     emit_at: Instant,
+    interrupt_until: Option<Instant>,
 }
 
 /// Recognizes short, uninterrupted single taps from raw HandyKeys key events.
@@ -109,6 +110,7 @@ impl TapAloneRecognizer {
         let results = self.drain_expired_at(now);
 
         if is_interruption_activity(event) {
+            self.cancel_pending_releases_interrupted_by(None, now);
             self.interrupt_all_active();
             return results;
         }
@@ -118,6 +120,7 @@ impl TapAloneRecognizer {
         };
 
         if event.is_key_down {
+            self.cancel_pending_releases_interrupted_by(Some(trigger), now);
             self.interrupt_active_except(trigger);
 
             if self.held_triggers.contains(&trigger) {
@@ -164,11 +167,18 @@ impl TapAloneRecognizer {
             active.interrupted |= modifier_snapshot_interrupts(event.modifiers, trigger);
             let press_duration = now.saturating_duration_since(active.started_at);
             if !active.interrupted && press_duration < active.pattern.max_press_duration {
+                let interrupt_until = (!active.pattern.post_release_interruption_window.is_zero())
+                    .then_some(now + active.pattern.post_release_interruption_window);
+                let suppression_deadline = now + active.pattern.double_tap_suppression;
+                let emit_at = interrupt_until.map_or(suppression_deadline, |deadline| {
+                    (deadline + Duration::from_nanos(1)).max(suppression_deadline)
+                });
                 self.pending_releases.insert(
                     trigger,
                     PendingRelease {
                         id: active.id,
-                        emit_at: now + active.pattern.double_tap_suppression,
+                        emit_at,
+                        interrupt_until,
                     },
                 );
             }
@@ -217,6 +227,21 @@ impl TapAloneRecognizer {
         for active in self.active_presses.values_mut() {
             active.interrupted = true;
         }
+    }
+
+    fn cancel_pending_releases_interrupted_by(
+        &mut self,
+        interrupting_trigger: Option<TriggerKey>,
+        now: Instant,
+    ) {
+        self.pending_releases.retain(|pending_trigger, pending| {
+            if interrupting_trigger == Some(*pending_trigger) {
+                return true;
+            }
+            pending
+                .interrupt_until
+                .is_none_or(|interrupt_until| now > interrupt_until)
+        });
     }
 }
 
@@ -312,6 +337,13 @@ mod tests {
             Duration::from_millis(250),
         )
         .unwrap()
+    }
+
+    fn tap_alone_with_post_release_interruption(
+        trigger: TriggerKey,
+        interruption_window: Duration,
+    ) -> TapAlone {
+        tap_alone(trigger).with_post_release_interruption_window(interruption_window)
     }
 
     #[test]
@@ -599,6 +631,153 @@ mod tests {
             recognizer.drain_expired_at(start + Duration::from_millis(270)),
             vec![TapAloneEvent { id }]
         );
+    }
+
+    #[test]
+    fn tap_alone_cancels_when_remapped_chord_starts_inside_post_release_window() {
+        let start = Instant::now();
+        let mut recognizer = TapAloneRecognizer::new();
+        recognizer
+            .register(tap_alone_with_post_release_interruption(
+                TriggerKey::Modifier(Modifiers::CTRL_LEFT),
+                Duration::from_millis(30),
+            ))
+            .unwrap();
+
+        recognizer.process_event_at(&modifier_event(Modifiers::CTRL_LEFT, true), start);
+        recognizer.process_event_at(
+            &modifier_event(Modifiers::CTRL_LEFT, false),
+            start + Duration::from_millis(20),
+        );
+        recognizer.process_event_at(
+            &modifier_event(Modifiers::CMD_LEFT, true),
+            start + Duration::from_millis(29),
+        );
+        recognizer.process_event_at(
+            &key_event_with_modifiers(Key::C, true, Modifiers::CMD_LEFT),
+            start + Duration::from_millis(30),
+        );
+
+        assert!(recognizer
+            .drain_expired_at(start + Duration::from_millis(300))
+            .is_empty());
+    }
+
+    #[test]
+    fn tap_alone_cancels_at_post_release_window_boundary() {
+        let start = Instant::now();
+        let mut recognizer = TapAloneRecognizer::new();
+        recognizer
+            .register(tap_alone_with_post_release_interruption(
+                TriggerKey::Modifier(Modifiers::CTRL_LEFT),
+                Duration::from_millis(30),
+            ))
+            .unwrap();
+
+        recognizer.process_event_at(&modifier_event(Modifiers::CTRL_LEFT, true), start);
+        recognizer.process_event_at(
+            &modifier_event(Modifiers::CTRL_LEFT, false),
+            start + Duration::from_millis(20),
+        );
+        recognizer.process_event_at(
+            &modifier_event(Modifiers::CMD_LEFT, true),
+            start + Duration::from_millis(50),
+        );
+
+        assert!(recognizer
+            .drain_expired_at(start + Duration::from_millis(300))
+            .is_empty());
+    }
+
+    #[test]
+    fn tap_alone_preserves_pending_release_after_post_release_window() {
+        let start = Instant::now();
+        let mut recognizer = TapAloneRecognizer::new();
+        let id = recognizer
+            .register(tap_alone_with_post_release_interruption(
+                TriggerKey::Modifier(Modifiers::CTRL_LEFT),
+                Duration::from_millis(30),
+            ))
+            .unwrap();
+
+        recognizer.process_event_at(&modifier_event(Modifiers::CTRL_LEFT, true), start);
+        recognizer.process_event_at(
+            &modifier_event(Modifiers::CTRL_LEFT, false),
+            start + Duration::from_millis(20),
+        );
+        recognizer.process_event_at(
+            &modifier_event(Modifiers::CMD_LEFT, true),
+            start + Duration::from_millis(51),
+        );
+
+        assert_eq!(
+            recognizer.drain_expired_at(start + Duration::from_millis(270)),
+            vec![TapAloneEvent { id }]
+        );
+    }
+
+    #[test]
+    fn tap_alone_remains_pending_through_interruption_window_when_suppression_is_shorter() {
+        let start = Instant::now();
+        let mut recognizer = TapAloneRecognizer::new();
+        recognizer
+            .register(
+                TapAlone::new(
+                    TriggerKey::Modifier(Modifiers::CTRL_LEFT),
+                    Duration::from_millis(1000),
+                    Duration::from_millis(10),
+                )
+                .unwrap()
+                .with_post_release_interruption_window(Duration::from_millis(30)),
+            )
+            .unwrap();
+
+        recognizer.process_event_at(&modifier_event(Modifiers::CTRL_LEFT, true), start);
+        recognizer.process_event_at(
+            &modifier_event(Modifiers::CTRL_LEFT, false),
+            start + Duration::from_millis(20),
+        );
+        assert!(recognizer
+            .process_event_at(
+                &modifier_event(Modifiers::CMD_LEFT, true),
+                start + Duration::from_millis(40),
+            )
+            .is_empty());
+        assert!(recognizer
+            .drain_expired_at(start + Duration::from_millis(300))
+            .is_empty());
+    }
+
+    #[test]
+    fn tap_alone_remains_cancellable_when_suppression_equals_interruption_window() {
+        let start = Instant::now();
+        let mut recognizer = TapAloneRecognizer::new();
+        recognizer
+            .register(
+                TapAlone::new(
+                    TriggerKey::Modifier(Modifiers::CTRL_LEFT),
+                    Duration::from_millis(1000),
+                    Duration::from_millis(30),
+                )
+                .unwrap()
+                .with_post_release_interruption_window(Duration::from_millis(30)),
+            )
+            .unwrap();
+
+        recognizer.process_event_at(&modifier_event(Modifiers::CTRL_LEFT, true), start);
+        recognizer.process_event_at(
+            &modifier_event(Modifiers::CTRL_LEFT, false),
+            start + Duration::from_millis(20),
+        );
+        assert!(recognizer
+            .process_event_at(
+                &modifier_event(Modifiers::CMD_LEFT, true),
+                start + Duration::from_millis(50),
+            )
+            .is_empty());
+        assert!(recognizer
+            .drain_expired_at(start + Duration::from_millis(300))
+            .is_empty());
     }
 
     #[test]
