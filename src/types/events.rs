@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::hotkey::HotkeyEvent;
+use super::input_activity::InputActivity;
 use super::tap_alone::TapAloneEvent;
 use super::tap_pattern::TapPatternEvent;
 
@@ -12,4 +13,5 @@ pub enum HandyKeysEvent {
     Hotkey(HotkeyEvent),
     TapPattern(TapPatternEvent),
     TapAlone(TapAloneEvent),
+    InputActivity(InputActivity),
 }

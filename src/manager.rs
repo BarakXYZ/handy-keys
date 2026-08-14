@@ -11,8 +11,8 @@ use crate::listener::{BlockingHotkeys, KeyboardListener};
 use crate::tap_alone::TapAloneRecognizer;
 use crate::tap_pattern::TapPatternRecognizer;
 use crate::types::{
-    HandyKeysEvent, Hotkey, HotkeyEvent, HotkeyId, HotkeyState, KeyEvent, TapAlone, TapAloneEvent,
-    TapAloneId, TapPattern, TapPatternEvent, TapPatternId,
+    HandyKeysEvent, Hotkey, HotkeyEvent, HotkeyId, HotkeyState, InputActivity, KeyEvent, TapAlone,
+    TapAloneEvent, TapAloneId, TapPattern, TapPatternEvent, TapPatternId,
 };
 
 const RECV_TIMEOUT: Duration = Duration::from_millis(100);
@@ -32,6 +32,7 @@ struct ProcessedEvents {
     tap_alone_events: Vec<TapAloneEvent>,
     hotkey_events: Vec<HotkeyEvent>,
     tap_events: Vec<TapPatternEvent>,
+    input_activity: Option<InputActivity>,
 }
 
 impl ManagerState {
@@ -111,6 +112,7 @@ impl ManagerState {
             tap_alone_events,
             hotkey_events,
             tap_events,
+            input_activity: event.activity,
         }
     }
 }
@@ -566,6 +568,14 @@ fn send_processed_events(events: ProcessedEvents, sender: &Sender<HandyKeysEvent
     }
     for event in events.tap_events {
         if sender.send(HandyKeysEvent::TapPattern(event)).is_err() {
+            return false;
+        }
+    }
+    if let Some(activity) = events.input_activity {
+        if sender
+            .send(HandyKeysEvent::InputActivity(activity))
+            .is_err()
+        {
             return false;
         }
     }
@@ -1123,21 +1133,26 @@ mod tests {
         }
 
         #[test]
-        fn internal_activity_does_not_trigger_modifier_only_hotkeys() {
+        fn input_activity_is_exposed_without_triggering_modifier_only_hotkeys() {
             let mut state = ManagerState::new();
             let hotkey = Hotkey::new(Modifiers::CTRL_LEFT, None).unwrap();
             let id = HotkeyId(0);
             state.hotkeys.insert(id, hotkey);
 
+            let activity = InputActivity::MouseButtonDown(MouseButtonActivity::Left);
+
             let events = state.process_all_events(
-                &make_activity_event(
-                    Modifiers::CTRL_LEFT,
-                    InputActivity::MouseButtonDown(MouseButtonActivity::Left),
-                ),
+                &make_activity_event(Modifiers::CTRL_LEFT, activity),
                 Instant::now(),
             );
 
             assert!(events.hotkey_events.is_empty());
+            let (event_tx, event_rx) = mpsc::channel();
+            assert!(send_processed_events(events, &event_tx));
+            assert_eq!(
+                event_rx.try_recv().unwrap(),
+                HandyKeysEvent::InputActivity(activity)
+            );
         }
 
         #[test]
